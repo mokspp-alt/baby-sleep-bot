@@ -19,26 +19,6 @@ log = logging.getLogger(__name__)
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 HISTORY_TURNS = 10  # сколько последних обменов репликами помнить
 
-# Цены за 1 млн токенов, $: ввод, вывод, чтение кэша, запись кэша.
-PRICES = {
-    "claude-sonnet-5-5": (2.00, 10.00, 0.20, 2.50),
-    "claude-opus-5-5": (4.00, 20.00, 0.20, 5.00),
-    "claude-haiku-5-5": (0.10, 0.50, 0.01, 0.125),
-}
-
-
-def request_cost(model: str, usage) -> float:
-    """Стоимость запроса в долларах. Для неизвестной модели — по самой дорогой из таблицы,
-    чтобы не занижать."""
-    price_in, price_out, price_read, price_write = PRICES.get(model, PRICES["claude-opus-5-5"])
-    tokens = (
-        (usage.input_tokens or 0) * price_in
-        + (usage.output_tokens or 0) * price_out
-        + (getattr(usage, "cache_read_input_tokens", 0) or 0) * price_read
-        + (getattr(usage, "cache_creation_input_tokens", 0) or 0) * price_write
-    )
-    return tokens / 1_000_000
-
 SYSTEM = """\
 Ты — заботливый помощник родителей в Telegram-боте, который ведёт сон ребёнка.
 Родители пишут или говорят голосом (текст — расшифровка речи, в ней бывают ошибки).
@@ -128,7 +108,6 @@ class Assistant:
         self.client = anthropic.AsyncAnthropic(api_key=api_key, http_client=http_client,
                                                timeout=90.0)
         self.history: dict[int, list[dict]] = {}
-        self.on_usage = None  # (chat_id, model, usage) — бот записывает расход в базу
 
     @classmethod
     def from_env(cls) -> Assistant | None:
@@ -157,8 +136,6 @@ class Assistant:
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",
             )
-            if self.on_usage:
-                self.on_usage(chat_id, response.model or MODEL, response.usage)
             if response.stop_reason == "refusal":
                 raise RuntimeError("Claude отказался отвечать")
             messages.append({"role": "assistant", "content": response.content})

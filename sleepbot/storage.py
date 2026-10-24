@@ -36,16 +36,6 @@ CREATE TABLE IF NOT EXISTS overrides (
     ts TEXT NOT NULL,
     PRIMARY KEY (chat_id, day_id, target)
 );
-CREATE TABLE IF NOT EXISTS usage (
-    chat_id INTEGER NOT NULL,
-    ts TEXT NOT NULL,
-    model TEXT NOT NULL,
-    input INTEGER NOT NULL,
-    output INTEGER NOT NULL,
-    cache_read INTEGER NOT NULL,
-    cache_write INTEGER NOT NULL,
-    cost REAL NOT NULL
-);
 CREATE TABLE IF NOT EXISTS sent (
     chat_id INTEGER NOT NULL,
     key TEXT NOT NULL,
@@ -172,18 +162,6 @@ class Storage:
     def overrides(self, chat_id: int) -> dict:
         rows = self.db.execute("SELECT day_id, target, ts FROM overrides WHERE chat_id = ?", (chat_id,))
         return {(r["day_id"], r["target"]): datetime.fromisoformat(r["ts"]) for r in rows}
-
-    def add_usage(self, chat_id: int, ts: datetime, model: str, input: int, output: int,
-                  cache_read: int, cache_write: int, cost: float) -> None:
-        self.db.execute("INSERT INTO usage VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (chat_id, _utc(ts), model, input, output, cache_read, cache_write, cost))
-        self.db.commit()
-
-    def usage_total(self, since: datetime) -> tuple[int, float]:
-        """Запросов к Claude и их стоимость в долларах (по всем чатам) с момента since."""
-        r = self.db.execute("SELECT COUNT(*), COALESCE(SUM(cost), 0) FROM usage WHERE ts >= ?",
-                            (_utc(since),)).fetchone()
-        return r[0], r[1]
 
     def mark_sent(self, chat_id: int, key: str) -> bool:
         """True, если напоминание с этим ключом ещё не отправлялось."""

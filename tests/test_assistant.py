@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from sleepbot import bot
-from sleepbot.assistant import Assistant, request_cost, resolve_time
+from sleepbot.assistant import Assistant, resolve_time
 from sleepbot.schedule import NIGHT, WAKE
 from sleepbot.storage import Storage
 
@@ -32,15 +32,12 @@ class FakeMessages:
         if isinstance(item, Exception):
             raise item
         stop, content = item
-        usage = SimpleNamespace(input_tokens=5000, output_tokens=300,
-                                cache_read_input_tokens=0, cache_creation_input_tokens=0)
-        return SimpleNamespace(stop_reason=stop, content=content, model=kw["model"], usage=usage)
+        return SimpleNamespace(stop_reason=stop, content=content)
 
 
 def fake_assistant(responses):
     a = Assistant.__new__(Assistant)
     a.history = {}
-    a.on_usage = None
     a.client = SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages(responses)))
     return a
 
@@ -170,29 +167,3 @@ def test_resolve_time():
     assert resolve_time("23:40", "today", now) == datetime(2026, 10, 23, 23, 40, tzinfo=TZ)
     assert resolve_time("8:05", "yesterday", now) == datetime(2026, 10, 23, 8, 5, tzinfo=TZ)
     assert resolve_time("now", "today", now) == now
-
-
-def test_usage_is_recorded_and_reported():
-    s = configured_storage()
-    a = fake_assistant([
-        ("tool_use", [tool_use("t1", "record_event", kind="wake", time="now", day="today")]),
-        ("end_turn", [text("Записал.")]),
-    ])
-    a.on_usage = lambda chat_id, model, usage: s.add_usage(
-        chat_id, datetime.now(TZ), model, usage.input_tokens, usage.output_tokens, 0, 0,
-        request_cost(model, usage))
-    say(s, a, "проснулся")
-    count, cost = s.usage_total(datetime(2000, 1, 1, tzinfo=TZ))
-    # 2 запроса × (5000 × $2 + 300 × $10) / 1 млн = $0.026
-    assert count == 2 and abs(cost - 0.026) < 1e-9
-
-    sent = []
-
-    async def reply_text(t, reply_markup=None):
-        sent.append(t)
-
-    update = SimpleNamespace(effective_chat=SimpleNamespace(id=1),
-                             effective_message=SimpleNamespace(reply_text=reply_text))
-    asyncio.run(bot.cost_cmd(update, SimpleNamespace(application=SimpleNamespace(
-        bot_data={"storage": s}))))
-    assert "Всего: $0.03 — запросов: 2" in sent[0]

@@ -19,7 +19,7 @@ from telegram.ext import (
 )
 
 from . import onboarding
-from .assistant import Assistant, parse_hhmm, request_cost, resolve_time
+from .assistant import Assistant, parse_hhmm, resolve_time
 from .parsing import (
     is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
 )
@@ -53,7 +53,6 @@ HELP = (
     "/today — сон за сутки\n"
     "/week — сон за неделю\n"
     "/undo — удалить последнюю отметку\n"
-    "/cost — сколько потрачено на Claude\n"
     "/setup — заполнить анкету заново\n"
     "/tz Europe/Moscow — часовой пояс\n"
     "/remind 30 — за сколько минут напоминать (0 — только в момент укладывания)\n"
@@ -470,24 +469,6 @@ async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             week_text(chat, store(context), datetime.now(tz_of(chat))))
 
 
-async def cost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = store(context)
-    chat = s.chat(update.effective_chat.id)
-    now = datetime.now(tz_of(chat))
-    rate = float(os.environ.get("USD_RUB") or 0)
-    lines = ["💰 Расход на Claude (по всем чатам бота):"]
-    periods = (("Сегодня", now.replace(hour=0, minute=0, second=0, microsecond=0)),
-               ("За 30 дней", now - timedelta(days=30)),
-               ("Всего", datetime(2000, 1, 1, tzinfo=timezone.utc)))
-    for title, since in periods:
-        count, cost = s.usage_total(since)
-        rub = f" ≈ {cost * rate:.0f} ₽" if rate else ""
-        lines.append(f"{title}: ${cost:.2f}{rub} — запросов: {count}")
-    lines.append("\nСчитается с момента, когда в бот добавлен учёт. Распознавание голоса "
-                 "бесплатное: оно работает на вашем сервере.")
-    await update.effective_message.reply_text("\n".join(lines))
-
-
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = store(context)
     chat = s.chat(update.effective_chat.id)
@@ -836,12 +817,6 @@ def main() -> None:
     app.bot_data["storage"] = Storage(os.environ.get("DB_PATH", "sleep.db"))
     app.bot_data["stt"] = Transcriber()
     app.bot_data["assistant"] = Assistant.from_env()
-    if assistant := app.bot_data["assistant"]:
-        storage = app.bot_data["storage"]
-        assistant.on_usage = lambda chat_id, model, usage: storage.add_usage(
-            chat_id, datetime.now(timezone.utc), model, usage.input_tokens or 0,
-            usage.output_tokens or 0, getattr(usage, "cache_read_input_tokens", 0) or 0,
-            getattr(usage, "cache_creation_input_tokens", 0) or 0, request_cost(model, usage))
     log.info("Свободный диалог через Claude: %s",
              "включён" if app.bot_data["assistant"] else "выключен (нет ANTHROPIC_API_KEY)")
 
@@ -856,7 +831,6 @@ def main() -> None:
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
-    app.add_handler(CommandHandler("cost", cost_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
