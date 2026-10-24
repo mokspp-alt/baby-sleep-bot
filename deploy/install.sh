@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Установка или обновление бота на сервере одной командой:
 #   curl -fsSL https://raw.githubusercontent.com/mokspp-alt/baby-sleep-bot/main/deploy/install.sh | BOT_TOKEN=123:abc bash
-# Повторный запуск без BOT_TOKEN обновляет код и перезапускает только процесс бота.
+# Без BOT_TOKEN при первой установке скрипт спросит токен; повторный запуск обновляет
+# код и перезапускает только процесс бота. Короткий вариант для ручного набора:
+#   curl -L raw.githubusercontent.com/mokspp-alt/baby-sleep-bot/main/i | sh
 # Другие проекты на сервере не трогает: своя папка, свой PM2-процесс, без портов.
 set -euo pipefail
 
@@ -37,6 +39,11 @@ if [ ! -f .env ]; then
         sed -i 's/^WHISPER_MODEL=.*/WHISPER_MODEL=base/' .env
         echo "    Свободно ${avail_mb} МБ памяти — модель Whisper: base"
     fi
+fi
+if [ -z "${BOT_TOKEN:-}" ] && grep -q "^BOT_TOKEN=123456:" .env && [ -r /dev/tty ]; then
+    printf "Вставьте или наберите токен бота от @BotFather: " > /dev/tty
+    read -r BOT_TOKEN < /dev/tty || true
+    BOT_TOKEN=$(printf "%s" "$BOT_TOKEN" | tr -d "[:space:]")
 fi
 if [ -n "${BOT_TOKEN:-}" ]; then
     sed -i "s|^BOT_TOKEN=.*|BOT_TOKEN=${BOT_TOKEN}|" .env
