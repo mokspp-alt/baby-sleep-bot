@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 from . import onboarding
+from .assistant import Assistant, resolve_time
 from .parsing import (
     is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
 )
@@ -475,6 +476,75 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"Удалил: {what} в {hm(last.ts, tz_of(chat))}.")
 
 
+# --- свободный диалог через Claude -----------------------------------------------------
+
+
+class ChatTools:
+    """Действия, которые ассистент выполняет в базе бота для одного чата."""
+
+    def __init__(self, chat: Chat, s: Storage, now: datetime) -> None:
+        self.chat, self.s, self.now = chat, s, now
+
+    def record_event(self, kind: str, time: str, day: str) -> tuple[int, str]:
+        tz = tz_of(self.chat)
+        at = resolve_time(time, day, self.now)
+        if at > self.now + timedelta(minutes=5):
+            raise ValueError("время в будущем")
+        if kind == "sleep":
+            kind = classify_sleep(self.s.recent(self.chat.chat_id, self.now), at,
+                                  norm_of(self.chat, self.now), at.astimezone(tz).hour)
+        if kind not in (WAKE, NAP, NIGHT):
+            raise ValueError(f"неизвестный тип события {kind}")
+        event_id = self.s.add_event(self.chat.chat_id, kind, at)
+        what = {WAKE: "подъём", NAP: "дневной сон", NIGHT: "ночной сон"}[kind]
+        return event_id, f"Записано: {what} в {hm(at, tz)} ({at.astimezone(tz):%d.%m})."
+
+    def undo_last_event(self) -> str:
+        last = self.s.last_event(self.chat.chat_id)
+        if not last:
+            return "Отметок нет."
+        self.s.delete_event(self.chat.chat_id, last.id)
+        what = {WAKE: "подъём", NAP: "дневной сон", NIGHT: "ночной сон"}[last.kind]
+        return f"Удалено: {what} в {hm(last.ts, tz_of(self.chat))}."
+
+    def state(self) -> str:
+        chat, tz, now = self.chat, tz_of(self.chat), self.now
+        months = age_in_months(chat.birth_date, now.date())
+        sex = {"m": "мальчик", "f": "девочка"}.get(chat.gender, "пол не указан")
+        lines = [f"Сейчас {now:%d.%m %H:%M}. Ребёнок: {chat.child_name}, {sex}, {format_age(months)}."]
+        events = self.s.events(chat.chat_id, since=now - timedelta(hours=36))
+        names = {WAKE: "проснулся(ась)", NAP: "уснул(а) днём", NIGHT: "уснул(а) на ночь"}
+        lines.append("Отметки за полтора дня: " + ("; ".join(
+            f"{e.ts.astimezone(tz):%d.%m %H:%M} {names[e.kind]}" for e in events) or "нет") + ".")
+        plan = build_plan(self.s.recent(chat.chat_id, now), now, norm_of(chat, now))
+        lines.append(plan_text(chat, plan, now))
+        return "\n".join(lines)
+
+
+async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Chat,
+                                text: str, heard: str) -> bool:
+    """True, если сообщение обработал Claude; False — пусть разбирают правила."""
+    assistant: Assistant | None = context.application.bot_data.get("assistant")
+    if assistant is None:
+        return False
+    s = store(context)
+    now = datetime.now(tz_of(chat))
+    tools = ChatTools(chat, s, now)
+    try:
+        turn = await assistant.handle(chat.chat_id, text, tools.state(), tools)
+    except Exception:
+        log.exception("Claude недоступен, разбираю сообщение правилами")
+        return False
+    reply = heard + turn.text
+    event = s.event(chat.chat_id, turn.event_ids[-1]) if turn.event_ids else None
+    if event:
+        plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+        reply += "\n\n" + plan_text(chat, plan, now)
+    await update.effective_message.reply_text(
+        reply, reply_markup=event_keyboard(event) if event else KEYBOARD)
+    return True
+
+
 # --- сообщения ------------------------------------------------------------------------
 
 
@@ -496,6 +566,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         return
     if not chat.configured:
         await begin_setup(update, context)
+        return
+
+    # Кнопки разбираем сами — мгновенно и бесплатно; всё остальное — через Claude, если он есть.
+    if text not in (BTN_WAKE, BTN_SLEEP) and await handle_with_assistant(
+            update, context, chat, text, heard):
         return
 
     tz = tz_of(chat)
@@ -620,6 +695,9 @@ def main() -> None:
     app = builder.build()
     app.bot_data["storage"] = Storage(os.environ.get("DB_PATH", "sleep.db"))
     app.bot_data["stt"] = Transcriber()
+    app.bot_data["assistant"] = Assistant.from_env()
+    log.info("Свободный диалог через Claude: %s",
+             "включён" if app.bot_data["assistant"] else "выключен (нет ANTHROPIC_API_KEY)")
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup_cmd))
