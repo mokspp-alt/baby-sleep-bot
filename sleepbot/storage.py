@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS events (
     ts TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_chat_ts ON events (chat_id, ts);
+CREATE TABLE IF NOT EXISTS overrides (
+    chat_id INTEGER NOT NULL,
+    day_id INTEGER NOT NULL,
+    target TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    PRIMARY KEY (chat_id, day_id, target)
+);
 CREATE TABLE IF NOT EXISTS sent (
     chat_id INTEGER NOT NULL,
     key TEXT NOT NULL,
@@ -141,6 +148,20 @@ class Storage:
     def recent(self, chat_id: int, now: datetime) -> list[Event]:
         """События за последние двое суток — этого хватает для плана текущего дня."""
         return self.events(chat_id, since=now - timedelta(hours=48))
+
+    def set_override(self, chat_id: int, day_id: int, target: str, ts: datetime | None) -> None:
+        """Время сна, назначенное родителями на день; None — вернуть расчётное."""
+        if ts is None:
+            self.db.execute("DELETE FROM overrides WHERE chat_id = ? AND day_id = ? AND target = ?",
+                            (chat_id, day_id, target))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO overrides VALUES (?, ?, ?, ?)",
+                            (chat_id, day_id, target, _utc(ts)))
+        self.db.commit()
+
+    def overrides(self, chat_id: int) -> dict:
+        rows = self.db.execute("SELECT day_id, target, ts FROM overrides WHERE chat_id = ?", (chat_id,))
+        return {(r["day_id"], r["target"]): datetime.fromisoformat(r["ts"]) for r in rows}
 
     def mark_sent(self, chat_id: int, key: str) -> bool:
         """True, если напоминание с этим ключом ещё не отправлялось."""

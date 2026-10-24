@@ -115,6 +115,7 @@ class DayPlan:
     night: timedelta | None = None  # сколько спал прошлой ночью
     nap_shift: timedelta = timedelta(0)  # насколько раньше дневной сон из-за короткой ночи
     bed_shift: timedelta = timedelta(0)  # насколько раньше отбой из-за короткой ночи
+    manual: set[str] = field(default_factory=set)  # "nap0", "bed" — назначены родителями
 
 
 # Если запланированный сон не начался спустя столько времени — считаем его пропущенным.
@@ -125,8 +126,15 @@ def _hours(h: float) -> timedelta:
     return timedelta(minutes=round(h * 60))
 
 
-def build_plan(events: list[Event], now: datetime, norm: AgeNorm) -> DayPlan:
-    """Строит план текущего дня по событиям (в хронологическом порядке)."""
+Overrides = dict[tuple[int, str], datetime]
+
+
+def build_plan(events: list[Event], now: datetime, norm: AgeNorm,
+               overrides: Overrides | None = None) -> DayPlan:
+    """Строит план текущего дня по событиям (в хронологическом порядке).
+
+    overrides — время, назначенное родителями вручную: {(id утреннего подъёма, "nap0" / "bed"): время}.
+    """
     events = sorted(events, key=lambda e: e.ts)
     if not events:
         return DayPlan("unknown", None)
@@ -174,6 +182,9 @@ def build_plan(events: list[Event], now: datetime, norm: AgeNorm) -> DayPlan:
                 nap.end = max(nap.start + duration, now)
         else:
             start = cursor + window
+            if manual := (overrides or {}).get((plan.morning_wake.id, f"nap{i}")):
+                start = manual
+                plan.manual.add(f"nap{i}")
             nap = PlannedNap(start, start + duration)
             if now > start + SKIP_AFTER:
                 nap.skipped = True
@@ -182,6 +193,9 @@ def build_plan(events: list[Event], now: datetime, norm: AgeNorm) -> DayPlan:
         cursor = nap.end
 
     plan.bedtime = cursor + _hours(norm.wake_windows[-1]) - plan.bed_shift
+    if manual := (overrides or {}).get((plan.morning_wake.id, "bed")):
+        plan.bedtime = manual
+        plan.manual.add("bed")
     return plan
 
 
@@ -272,11 +286,11 @@ def due_reminders(
     targets: list[tuple[str, datetime, str]] = []
     for i, nap in enumerate(plan.naps):
         if not nap.started and not nap.skipped:
-            targets.append((f"{day}:nap{i}", nap.start, "дневной сон"))
+            targets.append((f"{day}:nap{i}@{nap.start:%H%M}", nap.start, "дневной сон"))
             break  # напоминаем только о ближайшем сне
     else:
         if plan.bedtime:
-            targets.append((f"{day}:bed", plan.bedtime, "отбой"))
+            targets.append((f"{day}:bed@{plan.bedtime:%H%M}", plan.bedtime, "отбой"))
 
     for key, at, what in targets:
         pre = at - before

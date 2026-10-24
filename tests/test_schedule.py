@@ -73,8 +73,8 @@ def test_reminders_before_and_at_nap():
         return [r.key for r in due_reminders(plan, now, TZ, NORM_2Y, before, None, "Миша")]
 
     assert due(at(11, 59)) == []
-    assert due(at(12, 0)) == ["2:nap0:pre"]
-    assert due(at(12, 30)) == ["2:nap0:now"]
+    assert due(at(12, 0)) == ["2:nap0@1230:pre"]
+    assert due(at(12, 30)) == ["2:nap0@1230:now"]
     assert due(at(12, 50)) == []
 
 
@@ -83,7 +83,7 @@ def test_bedtime_reminder_after_nap():
     now = at(18, 30)
     plan = build_plan(events, now, NORM_2Y)
     keys = [r.key for r in due_reminders(plan, now, TZ, NORM_2Y, timedelta(minutes=30), None, "Миша")]
-    assert keys == ["2:bed:pre"]
+    assert keys == ["2:bed@1900:pre"]
 
 
 def test_long_nap_and_morning_check():
@@ -133,3 +133,12 @@ def test_normal_night_keeps_day():
     plan = build_plan(events, at(8), NORM_2Y)
     assert plan.night == timedelta(hours=11)
     assert plan.nap_shift == plan.bed_shift == timedelta(0)
+
+
+def test_manual_times_override_plan():
+    events = [ev(1, NIGHT, at(20, 0, 23)), ev(2, WAKE, at(7))]
+    plan = build_plan(events, at(8), NORM_2Y, {(2, "nap0"): at(13, 0), (2, "bed"): at(20, 0)})
+    assert plan.naps[0].start == at(13, 0) and plan.bedtime == at(20, 0)
+    assert plan.manual == {"nap0", "bed"}
+    # Время на другой день не применяется.
+    assert build_plan(events, at(8), NORM_2Y, {(99, "bed"): at(20, 0)}).bedtime == at(19, 15)

@@ -19,7 +19,7 @@ from telegram.ext import (
 )
 
 from . import onboarding
-from .assistant import Assistant, resolve_time
+from .assistant import Assistant, parse_hhmm, resolve_time
 from .parsing import (
     is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
 )
@@ -83,6 +83,10 @@ def g(chat: Chat, masc: str, fem: str) -> str:
     return gendered(chat.gender, masc, fem)
 
 
+def day_plan(chat: Chat, s: Storage, now: datetime) -> DayPlan:
+    return build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now), s.overrides(chat.chat_id))
+
+
 def expected_plan(chat: Chat, now: datetime) -> DayPlan | None:
     """План на случай подъёма в обычное время — пока утренний подъём не отмечен."""
     if not chat.wake_usual:
@@ -107,8 +111,10 @@ def schedule_lines(plan: DayPlan, norm: AgeNorm, tz, now: datetime) -> list[str]
             lines.append(f"😴 {title} — спит с {hm(nap.start, tz)}, разбудить не позже "
                          f"{hm(nap.start + timedelta(hours=norm.nap_max), tz)}")
         else:
-            lines.append(f"😴 {title} — {hm(nap.start, tz)}–{hm(nap.end, tz)}")
-    lines.append(f"🌙 Отбой — {hm(plan.bedtime, tz)}")
+            mark = " (назначено вами)" if f"nap{i - 1}" in plan.manual else ""
+            lines.append(f"😴 {title} — {hm(nap.start, tz)}–{hm(nap.end, tz)}{mark}")
+    mark = " (назначено вами)" if "bed" in plan.manual else ""
+    lines.append(f"🌙 Отбой — {hm(plan.bedtime, tz)}{mark}")
     return lines
 
 
@@ -160,7 +166,7 @@ def night_lines(chat: Chat, plan: DayPlan, norm: AgeNorm) -> list[str]:
 
 def night_start_answer(chat: Chat, s: Storage, text: str, now: datetime) -> datetime | None:
     """«В 21:15» после утреннего подъёма — во сколько ребёнок уснул вчера вечером."""
-    plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+    plan = day_plan(chat, s, now)
     clock = parse_clock(normalize(text))
     if plan.morning_wake is None or plan.night is not None or clock is None:
         return None
@@ -181,7 +187,7 @@ def answer_question(chat: Chat, s: Storage, text: str, now: datetime) -> str:
     if topic == "history":
         return today_text(chat, s, now)
     tz = tz_of(chat)
-    plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+    plan = day_plan(chat, s, now)
     name = chat.child_name
 
     if plan.status == "nap":
@@ -285,8 +291,7 @@ def event_text(chat: Chat, s: Storage, event: Event, now: datetime) -> str:
         head = f"😴 {name} {g(chat, 'уснул', 'уснула')} днём в {hm(event.ts, tz)}"
     else:
         head = f"🌙 {name} {g(chat, 'уснул', 'уснула')} на ночь в {hm(event.ts, tz)}. Спокойной ночи!"
-    plan = build_plan(events, now, norm_of(chat, now))
-    return head + "\n\n" + plan_text(chat, plan, now)
+    return head + "\n\n" + plan_text(chat, day_plan(chat, s, now), now)
 
 
 # --- анкета ---------------------------------------------------------------------------
@@ -448,7 +453,7 @@ async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat := await configured_chat(update, context):
         s = store(context)
         now = datetime.now(tz_of(chat))
-        plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+        plan = day_plan(chat, s, now)
         await update.effective_message.reply_text(plan_text(chat, plan, now), reply_markup=KEYBOARD)
 
 
@@ -482,42 +487,153 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 class ChatTools:
     """Действия, которые ассистент выполняет в базе бота для одного чата."""
 
+    KINDS = {WAKE: "проснулся(ась)", NAP: "уснул(а) днём", NIGHT: "уснул(а) на ночь"}
+
     def __init__(self, chat: Chat, s: Storage, now: datetime) -> None:
         self.chat, self.s, self.now = chat, s, now
+        self.changed: list[int] = []  # события, затронутые в этом сообщении, — для кнопок
+        self.plan_changed = False  # менялись ли время сна или настройки
 
-    def record_event(self, kind: str, time: str, day: str) -> tuple[int, str]:
-        tz = tz_of(self.chat)
+    @property
+    def tz(self):
+        return tz_of(self.chat)
+
+    def _describe(self, kind: str, at: datetime) -> str:
+        return f"{self.KINDS[kind]} в {hm(at, self.tz)} ({at.astimezone(self.tz):%d.%m})"
+
+    def _when(self, time: str, day: str) -> datetime:
         at = resolve_time(time, day, self.now)
         if at > self.now + timedelta(minutes=5):
-            raise ValueError("время в будущем")
+            raise ValueError("это время ещё не наступило")
+        return at
+
+    def _kind(self, kind: str, at: datetime) -> str:
         if kind == "sleep":
             kind = classify_sleep(self.s.recent(self.chat.chat_id, self.now), at,
-                                  norm_of(self.chat, self.now), at.astimezone(tz).hour)
-        if kind not in (WAKE, NAP, NIGHT):
+                                  norm_of(self.chat, self.now), at.astimezone(self.tz).hour)
+        if kind not in self.KINDS:
             raise ValueError(f"неизвестный тип события {kind}")
-        event_id = self.s.add_event(self.chat.chat_id, kind, at)
-        what = {WAKE: "подъём", NAP: "дневной сон", NIGHT: "ночной сон"}[kind]
-        return event_id, f"Записано: {what} в {hm(at, tz)} ({at.astimezone(tz):%d.%m})."
+        return kind
 
-    def undo_last_event(self) -> str:
-        last = self.s.last_event(self.chat.chat_id)
-        if not last:
-            return "Отметок нет."
-        self.s.delete_event(self.chat.chat_id, last.id)
-        what = {WAKE: "подъём", NAP: "дневной сон", NIGHT: "ночной сон"}[last.kind]
-        return f"Удалено: {what} в {hm(last.ts, tz_of(self.chat))}."
+    def record_event(self, kind: str, time: str, day: str) -> str:
+        at = self._when(time, day)
+        kind = self._kind(kind, at)
+        event_id = self.s.add_event(self.chat.chat_id, kind, at)
+        self.changed.append(event_id)
+        return f"Записано #{event_id}: {self._describe(kind, at)}."
+
+    def update_event(self, event_id: int, kind: str, time: str, day: str) -> str:
+        event = self.s.event(self.chat.chat_id, event_id)
+        if not event:
+            raise ValueError(f"отметки #{event_id} нет")
+        at = event.ts if time == "keep" else self._when(time, day)
+        kind = event.kind if kind == "keep" else self._kind(kind, at)
+        self.s.update_event(self.chat.chat_id, event_id, kind=kind, ts=at)
+        self.changed.append(event_id)
+        return f"Исправлено #{event_id}: было {self._describe(event.kind, event.ts)}, " \
+               f"стало {self._describe(kind, at)}."
+
+    def delete_event(self, event_id: int) -> str:
+        event = self.s.event(self.chat.chat_id, event_id)
+        if not event:
+            raise ValueError(f"отметки #{event_id} нет")
+        self.s.delete_event(self.chat.chat_id, event_id)
+        self.plan_changed = True
+        return f"Удалено #{event_id}: {self._describe(event.kind, event.ts)}."
+
+    def set_plan_time(self, target: str, time: str) -> str:
+        plan = day_plan(self.chat, self.s, self.now)
+        if plan.morning_wake is None:
+            raise ValueError("сегодняшний подъём не отмечен — сначала нужен подъём")
+        if target == "nap":
+            index = next((i for i, n in enumerate(plan.naps) if not n.started), None)
+            if index is None:
+                raise ValueError("на сегодня запланированных дневных снов не осталось")
+            key, what = f"nap{index}", "дневной сон"
+        elif target == "bedtime":
+            key, what = "bed", "отбой"
+        else:
+            raise ValueError(f"неизвестная цель {target}")
+        if time == "auto":
+            self.s.set_override(self.chat.chat_id, plan.morning_wake.id, key, None)
+            self.plan_changed = True
+            return f"{what.capitalize()} снова считается автоматически."
+        at = resolve_time(time, "today", self.now)
+        if at < self.now - timedelta(minutes=5):
+            at += timedelta(days=1)  # «отбой в 0:30» — это уже после полуночи
+        self.s.set_override(self.chat.chat_id, plan.morning_wake.id, key, at)
+        self.plan_changed = True
+        return f"На сегодня {what} назначен на {hm(at, self.tz)}; напоминания придут к этому времени."
+
+    def update_settings(self, setting: str, value: str) -> str:
+        chat_id, v = self.chat.chat_id, value.strip()
+        if setting == "child_name":
+            self.s.update_chat(chat_id, child_name=v[:40])
+        elif setting == "gender":
+            if v not in ("m", "f"):
+                raise ValueError("пол: m или f")
+            self.s.update_chat(chat_id, gender=v)
+        elif setting == "birth_date":
+            birth = parse_birth_date(v)
+            if not birth or birth > self.now.date():
+                raise ValueError("дата рождения: ДД.ММ.ГГГГ")
+            self.s.update_chat(chat_id, birth_date=birth)
+        elif setting == "naps_per_day":
+            if v == "auto":
+                self.s.update_chat(chat_id, naps_pref=None)
+            elif v in ("0", "1", "2", "3"):
+                self.s.update_chat(chat_id, naps_pref=int(v))
+            else:
+                raise ValueError("число дневных снов: 0–3 или auto")
+        elif setting == "usual_wake":
+            if v == "none":
+                self.s.update_chat(chat_id, wake_usual=None)
+            elif hm_ := parse_hhmm(v):
+                self.s.update_chat(chat_id, wake_usual=f"{hm_[0]:02d}:{hm_[1]:02d}")
+            else:
+                raise ValueError("обычный подъём: ЧЧ:ММ или none")
+        elif setting == "remind_before_minutes":
+            if not v.isdigit() or int(v) > 180:
+                raise ValueError("минуты: 0–180")
+            self.s.update_chat(chat_id, remind_before=int(v))
+        elif setting == "morning_check":
+            if v == "off":
+                self.s.update_chat(chat_id, morning_check=None)
+            elif hm_ := parse_hhmm(v):
+                self.s.update_chat(chat_id, morning_check=f"{hm_[0]:02d}:{hm_[1]:02d}")
+            else:
+                raise ValueError("утренний вопрос: ЧЧ:ММ или off")
+        elif setting == "timezone":
+            try:
+                ZoneInfo(v)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ValueError("часовой пояс в формате Europe/Moscow") from None
+            self.s.update_chat(chat_id, tz=v)
+        else:
+            raise ValueError(f"неизвестная настройка {setting}")
+        self.chat = self.s.chat(chat_id)
+        self.plan_changed = True
+        return f"Настройка {setting} = {v} сохранена."
 
     def state(self) -> str:
-        chat, tz, now = self.chat, tz_of(self.chat), self.now
+        chat, tz, now = self.chat, self.tz, self.now
         months = age_in_months(chat.birth_date, now.date())
         sex = {"m": "мальчик", "f": "девочка"}.get(chat.gender, "пол не указан")
-        lines = [f"Сейчас {now:%d.%m %H:%M}. Ребёнок: {chat.child_name}, {sex}, {format_age(months)}."]
+        norm = norm_of(chat, now)
+        lines = [
+            f"Сейчас {now:%d.%m %H:%M} ({chat.tz}).",
+            f"Ребёнок: {chat.child_name}, {sex}, {format_age(months)}, родился {chat.birth_date:%d.%m.%Y}.",
+            f"Норма по возрасту: дневных снов {len(norm.naps)}, ночной сон {norm.night_hours} ч.",
+            f"Настройки: напоминать за {chat.remind_before} мин; обычный подъём "
+            f"{chat.wake_usual or 'по-разному'}; утренний вопрос {chat.morning_check or 'выключен'}; "
+            f"дневных снов по словам родителей: "
+            f"{chat.naps_pref if chat.naps_pref is not None else 'по возрасту'}.",
+        ]
         events = self.s.events(chat.chat_id, since=now - timedelta(hours=36))
-        names = {WAKE: "проснулся(ась)", NAP: "уснул(а) днём", NIGHT: "уснул(а) на ночь"}
         lines.append("Отметки за полтора дня: " + ("; ".join(
-            f"{e.ts.astimezone(tz):%d.%m %H:%M} {names[e.kind]}" for e in events) or "нет") + ".")
-        plan = build_plan(self.s.recent(chat.chat_id, now), now, norm_of(chat, now))
-        lines.append(plan_text(chat, plan, now))
+            f"#{e.id} {e.ts.astimezone(tz):%d.%m %H:%M} {self.KINDS[e.kind]}" for e in events)
+            or "нет") + ".")
+        lines.append(plan_text(chat, day_plan(chat, self.s, now), now))
         return "\n".join(lines)
 
 
@@ -531,15 +647,20 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
     now = datetime.now(tz_of(chat))
     tools = ChatTools(chat, s, now)
     try:
-        turn = await assistant.handle(chat.chat_id, text, tools.state(), tools)
+        reply_text = await assistant.handle(chat.chat_id, text, tools.state(), tools)
     except Exception:
-        log.exception("Claude недоступен, разбираю сообщение правилами")
-        return False
-    reply = heard + turn.text
-    event = s.event(chat.chat_id, turn.event_ids[-1]) if turn.event_ids else None
-    if event:
-        plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
-        reply += "\n\n" + plan_text(chat, plan, now)
+        if not (tools.changed or tools.plan_changed):
+            log.exception("Claude недоступен, разбираю сообщение правилами")
+            return False
+        # Изменения уже внесены — повторный разбор правилами записал бы их второй раз.
+        log.exception("Claude оборвался после изменений")
+        reply_text = "Изменения внесены, но ответ не получился. Проверьте план ниже."
+    reply = heard + reply_text
+    events = [e for e in (s.event(chat.chat_id, i) for i in reversed(tools.changed)) if e]
+    event = events[0] if events else None
+    if tools.changed or tools.plan_changed:
+        chat = s.chat(chat.chat_id)
+        reply += "\n\n" + plan_text(chat, day_plan(chat, s, now), now)
     await update.effective_message.reply_text(
         reply, reply_markup=event_keyboard(event) if event else KEYBOARD)
     return True
@@ -582,7 +703,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         return
     if not parsed and (night := night_start_answer(chat, s, text, now)):
         s.add_event(chat.chat_id, NIGHT, night)
-        plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+        plan = day_plan(chat, s, now)
         await update.effective_message.reply_text(
             heard + f"🌙 Записал: {g(chat, 'уснул', 'уснула')} вчера в {hm(night, tz)}.\n\n"
             + plan_text(chat, plan, now), reply_markup=KEYBOARD)
@@ -666,7 +787,7 @@ async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
             tz = tz_of(chat)
             now = datetime.now(tz)
             norm = norm_of(chat, now)
-            plan = build_plan(s.recent(chat.chat_id, now), now, norm)
+            plan = build_plan(s.recent(chat.chat_id, now), now, norm, s.overrides(chat.chat_id))
             check = None
             if chat.morning_check:
                 h, m = map(int, chat.morning_check.split(":"))

@@ -76,11 +76,11 @@ def test_free_text_records_wake():
 
     calls = a.client.beta.messages.calls
     first = calls[0]
-    assert first["model"] == "claude-opus-5-5"
+    assert first["model"] == "claude-sonnet-5-5"
     assert first["fallbacks"] == "default"
     assert "Лёва, мальчик" in first["messages"][-1]["content"]
     tool_result = calls[1]["messages"][-1]["content"][0]
-    assert tool_result["tool_use_id"] == "t1" and "Записано: подъём в 00:01" in tool_result["content"]
+    assert tool_result["tool_use_id"] == "t1" and "проснулся(ась) в 00:01" in tool_result["content"]
     # В памяти диалога — только текст реплик.
     assert a.history[1] == [
         {"role": "user", "content": "сегодня Лёва плохо спал и проснулся в 0:01"},
@@ -88,18 +88,63 @@ def test_free_text_records_wake():
     ]
 
 
-def test_correction_undoes_and_rerecords():
+def test_correction_updates_event_by_id():
     s = configured_storage()
-    s.add_event(1, NIGHT, datetime.now(TZ) - timedelta(minutes=30))
+    event_id = s.add_event(1, NIGHT, datetime.now(TZ) - timedelta(minutes=30))
     a = fake_assistant([
-        ("tool_use", [tool_use("t1", "undo_last_event"),
-                      tool_use("t2", "record_event", kind="night", time="21:30", day="yesterday")]),
+        ("tool_use", [tool_use("t1", "update_event", event_id=event_id, kind="keep",
+                               time="21:30", day="yesterday")]),
         ("end_turn", [text("Исправил: уснул вчера в 21:30.")]),
     ])
-    say(s, a, "нет, он уснул вчера в 21:30")
+    reply = say(s, a, "нет, он уснул вчера в 21:30")
+    assert f"#{event_id}" in a.client.beta.messages.calls[0]["messages"][-1]["content"]
     [event] = s.events(1, datetime(2000, 1, 1, tzinfo=TZ))
     assert event.kind == NIGHT
     assert event.ts.astimezone(TZ) == resolve_time("21:30", "yesterday", datetime.now(TZ))
+    assert "Исправил" in reply
+
+
+def test_set_bedtime_and_settings():
+    s = configured_storage()
+    s.add_event(1, WAKE, datetime.now(TZ) - timedelta(hours=1))
+    a = fake_assistant([
+        ("tool_use", [tool_use("t1", "set_plan_time", target="bedtime", time="23:50"),
+                      tool_use("t2", "update_settings", setting="remind_before_minutes", value="15")]),
+        ("end_turn", [text("Отбой сегодня в 23:50, напомню за 15 минут.")]),
+    ])
+    reply = say(s, a, "сегодня в гостях, уложим в 23:50, и напоминай за 15 минут")
+    assert "Отбой — 23:50 (назначено вами)" in reply
+    assert s.chat(1).remind_before == 15
+
+
+def test_free_question_without_changes():
+    s = configured_storage()
+    a = fake_assistant([("end_turn", [text("Обычно в 2 года хватает одной прогулки днём.")])])
+    reply = say(s, a, "сколько гулять с ребёнком зимой?")
+    assert reply == "Обычно в 2 года хватает одной прогулки днём."
+    assert s.events(1, datetime(2000, 1, 1, tzinfo=TZ)) == []
+
+
+def test_tool_error_goes_back_to_model():
+    s = configured_storage()
+    a = fake_assistant([
+        ("tool_use", [tool_use("t1", "delete_event", event_id=999)]),
+        ("end_turn", [text("Не нашёл такой отметки.")]),
+    ])
+    say(s, a, "удали отметку")
+    result = a.client.beta.messages.calls[1]["messages"][-1]["content"][0]
+    assert result["is_error"] and "#999" in result["content"]
+
+
+def test_failure_after_changes_does_not_duplicate():
+    s = configured_storage()
+    a = fake_assistant([
+        ("tool_use", [tool_use("t1", "record_event", kind="wake", time="now", day="today")]),
+        ConnectionError("обрыв"),
+    ])
+    reply = say(s, a, "проснулся")
+    assert "Изменения внесены" in reply
+    assert [e.kind for e in s.events(1, datetime(2000, 1, 1, tzinfo=TZ))] == [WAKE]
 
 
 def test_api_failure_falls_back_to_rules():
