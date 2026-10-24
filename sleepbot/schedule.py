@@ -1,0 +1,241 @@
+"""Нормы сна по возрасту и расчёт плана дня. Чистая логика без Telegram и БД."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+
+WAKE = "wake"
+NAP = "nap"
+NIGHT = "night"
+
+
+@dataclass(frozen=True)
+class AgeNorm:
+    """Окна бодрствования (часы) и длительность дневных снов (часы).
+
+    wake_windows всегда на одно длиннее naps: окно перед каждым сном и окно перед ночью.
+    """
+
+    min_months: int
+    wake_windows: tuple[float, ...]
+    naps: tuple[float, ...]
+    nap_max: float  # после этого дневной сон лучше прервать, чтобы не сбить ночь
+    night_hours: str
+
+    def __post_init__(self) -> None:
+        assert len(self.wake_windows) == len(self.naps) + 1
+
+
+# Усреднённые рекомендации педиатров и сомнологов. У каждого ребёнка свой ритм:
+# это стартовая точка, а не правило.
+NORMS: tuple[AgeNorm, ...] = (
+    AgeNorm(4, (1.75, 2.0, 2.0, 2.25), (1.25, 1.25, 0.5), 2.0, "11–12"),
+    AgeNorm(6, (2.5, 2.75, 3.0), (1.5, 1.25), 2.0, "11–12"),
+    AgeNorm(9, (3.0, 3.25, 3.75), (1.5, 1.25), 2.0, "11–12"),
+    AgeNorm(12, (3.25, 3.75, 4.0), (1.5, 1.0), 2.0, "11–12"),
+    AgeNorm(15, (5.0, 4.5), (2.25,), 3.0, "11–12"),
+    AgeNorm(18, (5.25, 4.75), (2.0,), 2.75, "11–12"),
+    AgeNorm(24, (5.5, 5.0), (1.75,), 2.5, "10.5–11.5"),
+    AgeNorm(36, (6.0, 5.5), (1.25,), 1.75, "10.5–11.5"),
+    AgeNorm(48, (12.5,), (), 0.0, "10–11"),
+)
+
+
+def age_in_months(birth: date, today: date) -> int:
+    months = (today.year - birth.year) * 12 + today.month - birth.month
+    if today.day < birth.day:
+        months -= 1
+    return max(months, 0)
+
+
+def norm_for_age(months: int) -> AgeNorm:
+    chosen = NORMS[0]
+    for norm in NORMS:
+        if months >= norm.min_months:
+            chosen = norm
+    return chosen
+
+
+def format_age(months: int) -> str:
+    years, rest = divmod(months, 12)
+    if years == 0:
+        return f"{rest} мес."
+    word = "год" if years == 1 else ("года" if years < 5 else "лет")
+    return f"{years} {word}" + (f" {rest} мес." if rest else "")
+
+
+@dataclass(frozen=True)
+class Event:
+    id: int
+    kind: str  # WAKE, NAP или NIGHT
+    ts: datetime  # aware
+
+
+@dataclass
+class PlannedNap:
+    start: datetime
+    end: datetime
+    started: bool = False  # начало подтверждено событием
+    finished: bool = False  # конец подтверждён событием
+    skipped: bool = False
+    event_id: int | None = None
+
+
+@dataclass
+class DayPlan:
+    status: str  # "awake", "nap", "night", "unknown"
+    status_since: datetime | None
+    morning_wake: Event | None = None
+    naps: list[PlannedNap] = field(default_factory=list)
+    bedtime: datetime | None = None
+
+
+# Если запланированный сон не начался спустя столько времени — считаем его пропущенным.
+SKIP_AFTER = timedelta(hours=2)
+
+
+def _hours(h: float) -> timedelta:
+    return timedelta(minutes=round(h * 60))
+
+
+def build_plan(events: list[Event], now: datetime, norm: AgeNorm) -> DayPlan:
+    """Строит план текущего дня по событиям (в хронологическом порядке)."""
+    events = sorted(events, key=lambda e: e.ts)
+    if not events:
+        return DayPlan("unknown", None)
+
+    last = events[-1]
+    status = {WAKE: "awake", NAP: "nap", NIGHT: "night"}[last.kind]
+    plan = DayPlan(status, last.ts)
+    if status == "night":
+        return plan
+
+    # Утренний подъём — первый подъём после последнего ночного сна,
+    # а без ночного сна в истории — первый подъём за последние сутки.
+    night_idx = max((i for i, e in enumerate(events) if e.kind == NIGHT), default=-1)
+    candidates = events[night_idx + 1:]
+    if night_idx < 0:
+        candidates = [e for e in candidates if now - e.ts < timedelta(hours=20)]
+    first_wake = next((i for i, e in enumerate(candidates) if e.kind == WAKE), None)
+    if first_wake is None:
+        return plan
+    day = candidates[first_wake:]
+    plan.morning_wake = day[0]
+
+    actual: list[PlannedNap] = []
+    for i, e in enumerate(day):
+        if e.kind != NAP:
+            continue
+        wake = next((w for w in day[i + 1:] if w.kind == WAKE), None)
+        actual.append(PlannedNap(e.ts, wake.ts if wake else e.ts, True, wake is not None, event_id=e.id))
+
+    cursor = plan.morning_wake.ts
+    for i in range(max(len(norm.naps), len(actual))):
+        window = _hours(norm.wake_windows[min(i, len(norm.wake_windows) - 1)])
+        duration = _hours(norm.naps[min(i, len(norm.naps) - 1)]) if norm.naps else timedelta(hours=1)
+        if i < len(actual):
+            nap = actual[i]
+            if not nap.finished:
+                nap.end = max(nap.start + duration, now)
+        else:
+            start = cursor + window
+            nap = PlannedNap(start, start + duration)
+            if now > start + SKIP_AFTER:
+                nap.skipped = True
+                nap.end = start  # пропущенный сон: следующее окно отсчитываем от его плана
+        plan.naps.append(nap)
+        cursor = nap.end
+
+    plan.bedtime = cursor + _hours(norm.wake_windows[-1])
+    return plan
+
+
+def classify_sleep(events: list[Event], at: datetime, norm: AgeNorm, local_hour: int) -> str:
+    """Решает, дневной это сон или ночной, если родитель не сказал явно."""
+    if local_hour >= 18 or local_hour < 5:
+        return NIGHT
+    plan = build_plan([e for e in events if e.ts <= at], at, norm)
+    if plan.morning_wake is None:
+        return NAP
+    naps_done = sum(1 for n in plan.naps if n.started)
+    if naps_done >= len(norm.naps):
+        return NIGHT
+    if plan.bedtime and at >= plan.bedtime - timedelta(hours=1, minutes=30):
+        return NIGHT
+    return NAP
+
+
+@dataclass(frozen=True)
+class Reminder:
+    key: str
+    text: str
+
+
+PRE_WINDOW = timedelta(minutes=10)
+AT_WINDOW = timedelta(minutes=15)
+
+
+def _fmt(dt: datetime, tz) -> str:
+    return dt.astimezone(tz).strftime("%H:%M")
+
+
+def due_reminders(
+    plan: DayPlan,
+    now: datetime,
+    tz,
+    norm: AgeNorm,
+    before: timedelta,
+    morning_check: datetime | None,
+    name: str,
+) -> list[Reminder]:
+    """Напоминания, которые пора отправить сейчас. Повторы отсекаются по ключу снаружи.
+
+    Окна короткие, чтобы после перезапуска бот не присылал давно устаревшее.
+    """
+    out: list[Reminder] = []
+
+    if plan.status == "night" and morning_check and morning_check <= now < morning_check + AT_WINDOW:
+        out.append(Reminder(
+            f"morning:{morning_check.date().isoformat()}",
+            f"☀️ {name} уже проснулся(ась)? Отметьте подъём, чтобы я рассчитал день.",
+        ))
+
+    if plan.status == "nap" and plan.naps:
+        current = next((n for n in plan.naps if n.started and not n.finished), None)
+        if current and norm.nap_max and now >= current.start + _hours(norm.nap_max):
+            out.append(Reminder(
+                f"long:{current.event_id}",
+                f"⏰ Дневной сон идёт уже {format_duration(now - current.start)}. "
+                "Можно аккуратно будить, чтобы вечером легко уснуть.",
+            ))
+
+    if plan.status != "awake" or plan.morning_wake is None:
+        return out
+
+    day = plan.morning_wake.id
+    targets: list[tuple[str, datetime, str]] = []
+    for i, nap in enumerate(plan.naps):
+        if not nap.started and not nap.skipped:
+            targets.append((f"{day}:nap{i}", nap.start, "дневной сон"))
+            break  # напоминаем только о ближайшем сне
+    else:
+        if plan.bedtime:
+            targets.append((f"{day}:bed", plan.bedtime, "отбой"))
+
+    for key, at, what in targets:
+        pre = at - before
+        if before > timedelta(0) and pre <= now < min(pre + PRE_WINDOW, at):
+            minutes = round(before.total_seconds() / 60)
+            out.append(Reminder(f"{key}:pre", f"🔔 Через {minutes} мин {what} — в {_fmt(at, tz)}."))
+        if at <= now < at + AT_WINDOW:
+            out.append(Reminder(f"{key}:now", f"😴 Пора укладывать: {what} ({_fmt(at, tz)})."))
+    return out
+
+
+def format_duration(delta: timedelta) -> str:
+    minutes = max(int(delta.total_seconds() // 60), 0)
+    h, m = divmod(minutes, 60)
+    if h and m:
+        return f"{h} ч {m} мин"
+    return f"{h} ч" if h else f"{m} мин"
