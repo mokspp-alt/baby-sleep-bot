@@ -1,2 +1,5 @@
 python-telegram-bot[job-queue]==22.8
 tzdata==2025.2
+faster-whisper==1.2.1
+# av 17+ несовместим с faster-whisper 1.2.1 (decode_audio падает на metadata_errors)
+av==16.1.0

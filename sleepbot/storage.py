@@ -15,7 +15,11 @@ CREATE TABLE IF NOT EXISTS chats (
     birth_date TEXT,
     tz TEXT NOT NULL DEFAULT 'Europe/Moscow',
     remind_before INTEGER NOT NULL DEFAULT 30,
-    morning_check TEXT DEFAULT '08:30'
+    morning_check TEXT DEFAULT '08:30',
+    gender TEXT,
+    naps_pref INTEGER,
+    wake_usual TEXT,
+    setup_step TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,6 +35,10 @@ CREATE TABLE IF NOT EXISTS sent (
 );
 """
 
+# Колонки, добавленные после первой версии, — для баз, созданных раньше.
+MIGRATIONS = {"gender": "TEXT", "naps_pref": "INTEGER", "wake_usual": "TEXT", "setup_step": "TEXT"}
+FIELDS = {"child_name", "birth_date", "tz", "remind_before", "morning_check", *MIGRATIONS}
+
 
 @dataclass
 class Chat:
@@ -40,10 +48,14 @@ class Chat:
     tz: str
     remind_before: int
     morning_check: str | None
+    gender: str | None = None  # "m" / "f"
+    naps_pref: int | None = None  # сколько раз спит днём по словам родителей
+    wake_usual: str | None = None  # обычный подъём, "07:00"
+    setup_step: str | None = None  # текущий вопрос анкеты
 
     @property
     def configured(self) -> bool:
-        return bool(self.child_name and self.birth_date)
+        return bool(self.child_name and self.birth_date) and self.setup_step is None
 
 
 def _utc(ts: datetime) -> str:
@@ -55,6 +67,11 @@ class Storage:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(chats)")}
+        for name, sql in MIGRATIONS.items():
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE chats ADD COLUMN {name} {sql}")
+        self.db.commit()
 
     def chat(self, chat_id: int) -> Chat:
         self.db.execute("INSERT OR IGNORE INTO chats (chat_id) VALUES (?)", (chat_id,))
@@ -64,6 +81,7 @@ class Storage:
             r["chat_id"], r["child_name"],
             date.fromisoformat(r["birth_date"]) if r["birth_date"] else None,
             r["tz"], r["remind_before"], r["morning_check"],
+            r["gender"], r["naps_pref"], r["wake_usual"], r["setup_step"],
         )
 
     def chats(self) -> list[Chat]:
@@ -73,7 +91,7 @@ class Storage:
     def update_chat(self, chat_id: int, **fields) -> None:
         self.chat(chat_id)
         for name, value in fields.items():
-            assert name in {"child_name", "birth_date", "tz", "remind_before", "morning_check"}
+            assert name in FIELDS
             if isinstance(value, date):
                 value = value.isoformat()
             self.db.execute(f"UPDATE chats SET {name} = ? WHERE chat_id = ?", (value, chat_id))

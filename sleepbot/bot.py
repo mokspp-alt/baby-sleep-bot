@@ -1,26 +1,31 @@
-"""Telegram-бот: кнопки и текст → события сна, план дня, напоминания."""
+"""Telegram-бот: голос, кнопки и текст → события сна, план дня, ответы и напоминания."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+import tempfile
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import (
-    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update,
+    InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update,
 )
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
-from .parsing import parse_birth_date, parse_event
+from . import onboarding
+from .parsing import is_question, parse_birth_date, parse_event, question_topic
 from .schedule import (
     NAP, NIGHT, WAKE, AgeNorm, DayPlan, Event, age_in_months, build_plan, classify_sleep,
-    due_reminders, format_age, format_duration, norm_for_age,
+    due_reminders, format_age, format_duration, gendered, norm_for,
 )
 from .storage import Chat, Storage
+from .stt import Transcriber
 
 log = logging.getLogger(__name__)
 
@@ -30,18 +35,24 @@ BTN_PLAN = "📅 План"
 BTN_TODAY = "📊 Сегодня"
 KEYBOARD = ReplyKeyboardMarkup([[BTN_WAKE, BTN_SLEEP], [BTN_PLAN, BTN_TODAY]], resize_keyboard=True)
 
+# Глагол в прошедшем времени — это отметка, даже если дальше идёт вопрос
+# («проснулся, когда теперь спать?»). «Когда ему засыпать?» — только вопрос.
+_PAST_EVENT = re.compile(r"просну\w*л|проснул|уснул|заснул|встал|л[её]г\b|легл|уложил|разбудил", re.I)
+
 HELP = (
-    "Отмечайте подъёмы и засыпания кнопками или текстом — можно надиктовать:\n"
-    "• «проснулся в 6:50», «уснула 10 минут назад», «легли на ночь в 20:15»\n"
-    "Дневной это сон или ночной, я определяю сам; если ошибся — поправьте кнопкой.\n\n"
+    "Говорите голосовым или пишите:\n"
+    "• «проснулся», «проснулась в 6:50», «уснул 10 минут назад», «легли на ночь в 20:15»\n"
+    "• «когда спать?», «во сколько отбой?», «сколько он спал?»\n"
+    "Можно и кнопками внизу. Дневной это сон или ночной, я определяю сам; если ошибся — "
+    "поправьте кнопкой под сообщением.\n\n"
     "Команды:\n"
     "/plan — план на сегодня\n"
     "/today — сон за сутки\n"
     "/week — сон за неделю\n"
     "/undo — удалить последнюю отметку\n"
-    "/child Имя ДД.ММ.ГГГГ — имя и дата рождения\n"
+    "/setup — заполнить анкету заново\n"
     "/tz Europe/Moscow — часовой пояс\n"
-    "/remind 30 — за сколько минут напоминать (0 — не напоминать заранее)\n"
+    "/remind 30 — за сколько минут напоминать (0 — только в момент укладывания)\n"
     "/morning 08:30 — спросить про подъём, если он не отмечен (off — не спрашивать)"
 )
 
@@ -50,36 +61,38 @@ def store(context: ContextTypes.DEFAULT_TYPE) -> Storage:
     return context.application.bot_data["storage"]
 
 
-def tz_of(chat: Chat) -> ZoneInfo:
+def tz_of(chat: Chat):
+    if m := re.fullmatch(r"UTC([+-])(\d{2}):(\d{2})", chat.tz):
+        offset = timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+        return timezone(offset if m.group(1) == "+" else -offset, chat.tz)
     return ZoneInfo(chat.tz)
 
 
 def norm_of(chat: Chat, now: datetime) -> AgeNorm:
-    return norm_for_age(age_in_months(chat.birth_date, now.date()))
+    return norm_for(age_in_months(chat.birth_date, now.date()), chat.naps_pref)
 
 
-def hm(dt: datetime, tz: ZoneInfo) -> str:
+def hm(dt: datetime, tz) -> str:
     return dt.astimezone(tz).strftime("%H:%M")
 
 
-def plan_text(chat: Chat, plan: DayPlan, now: datetime) -> str:
-    tz = tz_of(chat)
-    months = age_in_months(chat.birth_date, now.date())
-    norm = norm_for_age(months)
-    lines = [f"📅 План на сегодня — {chat.child_name}, {format_age(months)}"]
+def g(chat: Chat, masc: str, fem: str) -> str:
+    return gendered(chat.gender, masc, fem)
 
-    if plan.status == "night":
-        lines.append(f"🌙 Ночной сон с {hm(plan.status_since, tz)}, "
-                     f"идёт {format_duration(now - plan.status_since)}.")
-        lines.append(f"Норма ночного сна в этом возрасте — {norm.night_hours} ч.")
-        lines.append("Утром отметьте подъём — и я рассчитаю дневной сон и отбой.")
-        return "\n".join(lines)
-    if plan.morning_wake is None:
-        lines.append("Утренний подъём не отмечен. Нажмите «☀️ Проснулись» "
-                     "или напишите, например, «проснулся в 7:10».")
-        return "\n".join(lines)
 
-    lines.append(f"☀️ Подъём — {hm(plan.morning_wake.ts, tz)}")
+def expected_plan(chat: Chat, now: datetime) -> DayPlan | None:
+    """План на случай подъёма в обычное время — пока утренний подъём не отмечен."""
+    if not chat.wake_usual:
+        return None
+    h, m = map(int, chat.wake_usual.split(":"))
+    wake = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if wake < now - timedelta(hours=12):
+        wake += timedelta(days=1)
+    return build_plan([Event(0, WAKE, wake)], wake, norm_of(chat, now))
+
+
+def schedule_lines(plan: DayPlan, norm: AgeNorm, tz, now: datetime) -> list[str]:
+    lines = [f"☀️ Подъём — {hm(plan.morning_wake.ts, tz)}"]
     for i, nap in enumerate(plan.naps, 1):
         title = "Дневной сон" if len(plan.naps) == 1 else f"Сон {i}"
         if nap.skipped:
@@ -88,12 +101,34 @@ def plan_text(chat: Chat, plan: DayPlan, now: datetime) -> str:
             lines.append(f"😴 {title} — {hm(nap.start, tz)}–{hm(nap.end, tz)} "
                          f"({format_duration(nap.end - nap.start)}) ✓")
         elif nap.started:
-            lines.append(f"😴 {title} — спит с {hm(nap.start, tz)}, "
-                         f"разбудить не позже {hm(nap.start + timedelta(hours=norm.nap_max), tz)}")
+            lines.append(f"😴 {title} — спит с {hm(nap.start, tz)}, разбудить не позже "
+                         f"{hm(nap.start + timedelta(hours=norm.nap_max), tz)}")
         else:
-            lines.append(f"😴 {title} — {hm(nap.start, tz)}–{hm(nap.end, tz)} (план)")
+            lines.append(f"😴 {title} — {hm(nap.start, tz)}–{hm(nap.end, tz)}")
     lines.append(f"🌙 Отбой — {hm(plan.bedtime, tz)}")
+    return lines
 
+
+def plan_text(chat: Chat, plan: DayPlan, now: datetime) -> str:
+    tz = tz_of(chat)
+    months = age_in_months(chat.birth_date, now.date())
+    norm = norm_of(chat, now)
+    lines = [f"📅 План на сегодня — {chat.child_name}, {format_age(months)}"]
+
+    if plan.morning_wake is None:
+        if plan.status == "night":
+            lines.append(f"🌙 Ночной сон с {hm(plan.status_since, tz)}, "
+                         f"идёт {format_duration(now - plan.status_since)}. "
+                         f"Норма в этом возрасте — {norm.night_hours} ч.")
+        else:
+            lines.append("Утренний подъём не отмечен.")
+        if expected := expected_plan(chat, now):
+            lines.append(f"\nЕсли проснётся в {chat.wake_usual}:")
+            lines += schedule_lines(expected, norm, tz, now)[1:]
+        lines.append("\nУтром скажите «проснулся» — и я рассчитаю день точно.")
+        return "\n".join(lines)
+
+    lines += schedule_lines(plan, norm, tz, now)
     if any(n.skipped for n in plan.naps):
         lines.append("\nДневной сон пропущен, поэтому отбой раньше обычного.")
     if plan.status == "awake":
@@ -101,14 +136,45 @@ def plan_text(chat: Chat, plan: DayPlan, now: datetime) -> str:
     return "\n".join(lines)
 
 
+def answer_question(chat: Chat, s: Storage, text: str, now: datetime) -> str:
+    """Ответ на «когда спать?», «во сколько отбой?», «сколько спал?»."""
+    topic = question_topic(text)
+    if topic == "history":
+        return today_text(chat, s, now)
+    tz = tz_of(chat)
+    plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+    name = chat.child_name
+
+    if plan.status == "nap":
+        nap = next(n for n in plan.naps if n.started and not n.finished)
+        head = (f"{name} спит с {hm(nap.start, tz)}. Будить не позже "
+                f"{hm(nap.start + timedelta(hours=norm_of(chat, now).nap_max), tz)}, "
+                f"отбой примерно в {hm(plan.bedtime, tz)}.")
+    elif plan.morning_wake is None:
+        head = (f"{name} спит ночью." if plan.status == "night"
+                else "Подъём сегодня не отмечен — не от чего считать.")
+    else:
+        upcoming = next((n for n in plan.naps if not n.started and not n.skipped), None)
+        if upcoming and topic != "night":
+            head = _when("Дневной сон", upcoming.start, now, tz)
+        else:
+            head = _when("Отбой", plan.bedtime, now, tz)
+    return head + "\n\n" + plan_text(chat, plan, now)
+
+
+def _when(what: str, at: datetime, now: datetime, tz) -> str:
+    if at > now:
+        return f"{what} в {hm(at, tz)} — через {format_duration(at - now)}."
+    return f"Пора укладывать! {what} был по плану в {hm(at, tz)} ({format_duration(now - at)} назад)."
+
+
 def sessions(events: list[Event]) -> list[tuple[Event, datetime | None]]:
     """Пары «уснул → проснулся»."""
     out = []
     for i, e in enumerate(events):
         if e.kind in (NAP, NIGHT):
-            wake = next((w for w in events[i + 1:] if w.kind == WAKE), None)
-            nxt = next((w for w in events[i + 1:]), None)
-            out.append((e, wake.ts if wake and wake is nxt else None))
+            nxt = events[i + 1] if i + 1 < len(events) else None
+            out.append((e, nxt.ts if nxt and nxt.kind == WAKE else None))
     return out
 
 
@@ -170,72 +236,122 @@ def event_keyboard(event: Event) -> InlineKeyboardMarkup:
 def event_text(chat: Chat, s: Storage, event: Event, now: datetime) -> str:
     tz = tz_of(chat)
     events = s.recent(chat.chat_id, now)
+    name = chat.child_name
     if event.kind == WAKE:
         prev = [e for e in events if e.ts < event.ts]
-        head = f"☀️ Подъём в {hm(event.ts, tz)}"
+        head = f"☀️ {name} {g(chat, 'проснулся', 'проснулась')} в {hm(event.ts, tz)}"
         if prev and prev[-1].kind in (NAP, NIGHT):
-            head += f" — спал(а) {format_duration(event.ts - prev[-1].ts)}"
+            head += f" — {g(chat, 'спал', 'спала')} {format_duration(event.ts - prev[-1].ts)}"
     elif event.kind == NAP:
-        head = f"😴 Дневной сон с {hm(event.ts, tz)}"
+        head = f"😴 {name} {g(chat, 'уснул', 'уснула')} днём в {hm(event.ts, tz)}"
     else:
-        head = f"🌙 Ночной сон с {hm(event.ts, tz)}. Спокойной ночи!"
+        head = f"🌙 {name} {g(chat, 'уснул', 'уснула')} на ночь в {hm(event.ts, tz)}. Спокойной ночи!"
     plan = build_plan(events, now, norm_of(chat, now))
     return head + "\n\n" + plan_text(chat, plan, now)
 
 
-async def ensure_setup(update: Update, chat: Chat) -> bool:
-    if chat.configured:
-        return True
-    await update.effective_message.reply_text(
-        "Сначала расскажите о ребёнке: имя и дата рождения.\nНапример: Миша 12.03.2024"
+# --- анкета ---------------------------------------------------------------------------
+
+
+async def ask(update: Update, chat: Chat, step: str, prefix: str = "") -> None:
+    q = onboarding.question(step, chat.child_name, chat.gender)
+    markup = (ReplyKeyboardMarkup([q.options[i:i + 2] for i in range(0, len(q.options), 2)],
+                                  resize_keyboard=True, one_time_keyboard=True)
+              if q.options else ReplyKeyboardRemove())
+    await update.effective_message.reply_text(prefix + q.text, reply_markup=markup)
+
+
+async def begin_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    s = store(context)
+    s.update_chat(update.effective_chat.id, setup_step="name")
+    await ask(update, s.chat(update.effective_chat.id), "name",
+              "Привет! Я помогу следить за сном малыша: вы говорите мне голосом, когда он "
+              "проснулся или уснул, а я рассчитываю дневной сон и отбой по возрасту "
+              "и заранее напоминаю.\n\nСначала пара вопросов — можно отвечать голосовыми.\n\n")
+
+
+async def handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Chat,
+                       text: str, heard: str) -> None:
+    s = store(context)
+    now = datetime.now(tz_of(chat))
+    answer = onboarding.apply(
+        chat.setup_step, text, {"gender": chat.gender, "birth_date": chat.birth_date},
+        now.date(), datetime.now(timezone.utc),
     )
-    return False
+    if answer.error:
+        await ask(update, chat, chat.setup_step, heard + answer.error + "\n\n")
+        return
+    updates = dict(answer.updates)
+    if wake := updates.get("wake_usual"):
+        h, m = map(int, wake.split(":"))
+        updates["morning_check"] = f"{h + 1:02d}:{m:02d}"
+    s.update_chat(chat.chat_id, setup_step=answer.next_step, **updates)
+    chat = s.chat(chat.chat_id)
+    if answer.next_step:
+        await ask(update, chat, answer.next_step, heard)
+        return
+    await update.effective_message.reply_text(heard + setup_summary(chat), reply_markup=KEYBOARD)
+
+
+def setup_summary(chat: Chat) -> str:
+    tz = tz_of(chat)
+    now = datetime.now(tz)
+    months = age_in_months(chat.birth_date, now.date())
+    norm = norm_of(chat, now)
+    sex = {"m": "мальчик", "f": "девочка"}.get(chat.gender, "")
+    windows = ", ".join(format_duration(timedelta(hours=w)) for w in norm.wake_windows)
+    who = ", ".join(x for x in (chat.child_name, sex, format_age(months)) if x)
+    lines = [
+        f"Готово! {who}.",
+        f"Дневных снов: {len(norm.naps)}, окна бодрствования: {windows}, "
+        f"ночной сон: {norm.night_hours} ч. Часовой пояс: {chat.tz}.",
+    ]
+    if expected := expected_plan(chat, now):
+        lines.append(f"\nПри подъёме в {chat.wake_usual} примерный день:")
+        lines += schedule_lines(expected, norm, tz, now)[1:]
+    lines += [
+        f"\nНапомню за {chat.remind_before} мин до сна и в момент укладывания.",
+        "\nКак пользоваться — просто запишите голосовое:",
+        f"• «{g(chat, 'проснулся', 'проснулась')}» / «{g(chat, 'уснул', 'уснула')}» "
+        "(можно со временем: «в 7:20», «15 минут назад»)",
+        "• «когда спать?», «во сколько отбой?»",
+        "/help — все команды, /setup — изменить анкету.",
+    ]
+    return "\n".join(lines)
+
+
+# --- команды --------------------------------------------------------------------------
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = store(context).chat(update.effective_chat.id)
-    if not chat.configured:
-        await update.effective_message.reply_text(
-            "Привет! Я помогу следить за сном малыша: отмечайте подъёмы и засыпания, "
-            "а я рассчитаю дневной сон и отбой по возрасту и напомню заранее.\n\n"
-            "Напишите имя и дату рождения ребёнка, например: Миша 12.03.2024",
-            reply_markup=KEYBOARD,
-        )
-        return
-    await update.effective_message.reply_text(HELP, reply_markup=KEYBOARD)
+    if chat.configured:
+        await update.effective_message.reply_text(HELP, reply_markup=KEYBOARD)
+    elif chat.setup_step:
+        await ask(update, chat, chat.setup_step)
+    else:
+        await begin_setup(update, context)
+
+
+async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await begin_setup(update, context)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(HELP, reply_markup=KEYBOARD)
 
 
-async def set_child(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
-    birth = parse_birth_date(text)
-    if not birth:
-        return False
-    name = re.sub(r"\d{1,2}[./-]\d{1,2}[./-]\d{4}", "", text).strip(" ,") or "Малыш"
-    s = store(context)
-    chat_id = update.effective_chat.id
-    s.update_chat(chat_id, child_name=name, birth_date=birth)
-    chat = s.chat(chat_id)
-    now = datetime.now(tz_of(chat))
-    months = age_in_months(birth, now.date())
-    norm = norm_for_age(months)
-    windows = ", ".join(format_duration(timedelta(hours=w)) for w in norm.wake_windows)
-    await update.effective_message.reply_text(
-        f"Записал: {name}, {format_age(months)}.\n"
-        f"Дневных снов: {len(norm.naps)}, окна бодрствования: {windows}, "
-        f"ночной сон: {norm.night_hours} ч.\n"
-        f"Часовой пояс: {chat.tz} (поменять — /tz).\n\n"
-        "Теперь отмечайте подъём и засыпание кнопками внизу.",
-        reply_markup=KEYBOARD,
-    )
-    return True
-
-
 async def child_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await set_child(update, context, " ".join(context.args)):
-        await update.effective_message.reply_text("Формат: /child Миша 12.03.2024")
+    text = " ".join(context.args)
+    birth = parse_birth_date(text)
+    name = re.sub(r"\d{1,2}[./-]\d{1,2}[./-]\d{4}", "", text).strip(" ,")
+    if not birth or not name:
+        await update.effective_message.reply_text("Формат: /child Миша 12.03.2024 (или /setup — анкета)")
+        return
+    s = store(context)
+    s.update_chat(update.effective_chat.id, child_name=name, birth_date=birth)
+    await update.effective_message.reply_text(setup_summary(s.chat(update.effective_chat.id)),
+                                              reply_markup=KEYBOARD)
 
 
 async def tz_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -276,28 +392,35 @@ async def morning_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.effective_message.reply_text(f"Если к {arg.zfill(5)} подъём не отмечен — спрошу.")
 
 
+async def configured_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Chat | None:
+    chat = store(context).chat(update.effective_chat.id)
+    if chat.configured:
+        return chat
+    if chat.setup_step:
+        await ask(update, chat, chat.setup_step, "Сначала закончим анкету.\n\n")
+    else:
+        await begin_setup(update, context)
+    return None
+
+
 async def plan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = store(context)
-    chat = s.chat(update.effective_chat.id)
-    if not await ensure_setup(update, chat):
-        return
-    now = datetime.now(tz_of(chat))
-    plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
-    await update.effective_message.reply_text(plan_text(chat, plan, now), reply_markup=KEYBOARD)
+    if chat := await configured_chat(update, context):
+        s = store(context)
+        now = datetime.now(tz_of(chat))
+        plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+        await update.effective_message.reply_text(plan_text(chat, plan, now), reply_markup=KEYBOARD)
 
 
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = store(context)
-    chat = s.chat(update.effective_chat.id)
-    if await ensure_setup(update, chat):
-        await update.effective_message.reply_text(today_text(chat, s, datetime.now(tz_of(chat))))
+    if chat := await configured_chat(update, context):
+        await update.effective_message.reply_text(
+            today_text(chat, store(context), datetime.now(tz_of(chat))))
 
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    s = store(context)
-    chat = s.chat(update.effective_chat.id)
-    if await ensure_setup(update, chat):
-        await update.effective_message.reply_text(week_text(chat, s, datetime.now(tz_of(chat))))
+    if chat := await configured_chat(update, context):
+        await update.effective_message.reply_text(
+            week_text(chat, store(context), datetime.now(tz_of(chat))))
 
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -312,28 +435,41 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"Удалил: {what} в {hm(last.ts, tz_of(chat))}.")
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.effective_message.text or ""
+# --- сообщения ------------------------------------------------------------------------
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
+                      voice: bool = False) -> None:
     s = store(context)
     chat = s.chat(update.effective_chat.id)
+    heard = f"🎤 «{text}»\n\n" if voice else ""
+    private = update.effective_chat.type == "private"
+
     if text == BTN_PLAN:
         await plan_cmd(update, context)
         return
     if text == BTN_TODAY:
         await today_cmd(update, context)
         return
+    if chat.setup_step:
+        await handle_setup(update, context, chat, text, heard)
+        return
     if not chat.configured:
-        if not await set_child(update, context, text):
-            await ensure_setup(update, chat)
+        await begin_setup(update, context)
         return
 
     tz = tz_of(chat)
     now = datetime.now(tz)
     parsed = parse_event(text, now)
+    if is_question(text) and not (parsed and _PAST_EVENT.search(text)):
+        await update.effective_message.reply_text(heard + answer_question(chat, s, text, now),
+                                                  reply_markup=KEYBOARD)
+        return
     if not parsed:
-        if update.effective_chat.type == "private":
+        if private or voice:
             await update.effective_message.reply_text(
-                "Не понял. Напишите, например, «проснулся в 7:10» или «уснула 5 минут назад». /help"
+                heard + "Не понял. Скажите, например, «проснулся», «уснула 5 минут назад» "
+                "или «когда спать?». /help"
             )
         return
 
@@ -346,8 +482,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     event_id = s.add_event(chat.chat_id, kind, parsed.at)
     event = s.event(chat.chat_id, event_id)
     await update.effective_message.reply_text(
-        event_text(chat, s, event, now), reply_markup=event_keyboard(event)
+        heard + event_text(chat, s, event, now), reply_markup=event_keyboard(event)
     )
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_text(update, context, update.effective_message.text or "")
+
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    media = message.voice or message.audio
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "voice.ogg")
+        try:
+            file = await media.get_file()
+            await file.download_to_drive(path)
+            text = await context.application.bot_data["stt"].transcribe(path)
+        except Exception:
+            log.exception("Не удалось распознать голосовое")
+            await message.reply_text("Не получилось распознать голосовое 😕 Напишите текстом.")
+            return
+    if not text:
+        await message.reply_text("Не расслышал. Повторите, пожалуйста.")
+        return
+    await handle_text(update, context, text, voice=True)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -390,21 +550,28 @@ async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                 h, m = map(int, chat.morning_check.split(":"))
                 check = now.replace(hour=h, minute=m, second=0, microsecond=0)
             for r in due_reminders(plan, now, tz, norm, timedelta(minutes=chat.remind_before),
-                                   check, chat.child_name):
+                                   check, chat.child_name, chat.gender):
                 if s.mark_sent(chat.chat_id, r.key):
                     await context.bot.send_message(chat.chat_id, r.text, reply_markup=KEYBOARD)
         except Exception:
             log.exception("Напоминание для чата %s не отправлено", chat.chat_id)
 
 
+async def preload_model(app: Application) -> None:
+    """Загружаем Whisper сразу при старте, чтобы первое голосовое не ждало."""
+    app.create_task(asyncio.to_thread(app.bot_data["stt"].load))
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     token = os.environ["BOT_TOKEN"]
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).concurrent_updates(True).post_init(preload_model).build()
     app.bot_data["storage"] = Storage(os.environ.get("DB_PATH", "sleep.db"))
+    app.bot_data["stt"] = Transcriber()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("setup", setup_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("child", child_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
@@ -415,6 +582,7 @@ def main() -> None:
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(tick, interval=60, first=5)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

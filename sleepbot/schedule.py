@@ -57,6 +57,24 @@ def norm_for_age(months: int) -> AgeNorm:
     return chosen
 
 
+def norm_for(months: int, naps: int | None = None) -> AgeNorm:
+    """Норма по возрасту; если родители сказали, сколько раз ребёнок спит днём,
+    берём ближайшую по возрасту норму с таким числом снов."""
+    base = norm_for_age(months)
+    if naps is None or naps == len(base.naps):
+        return base
+    same = [n for n in NORMS if len(n.naps) == naps]
+    return min(same, key=lambda n: abs(n.min_months - months)) if same else base
+
+
+def gendered(gender: str | None, masc: str, fem: str) -> str:
+    if gender == "f":
+        return fem
+    if gender == "m":
+        return masc
+    return f"{masc}/{fem}"
+
+
 def format_age(months: int) -> str:
     years, rest = divmod(months, 12)
     if years == 0:
@@ -188,6 +206,7 @@ def due_reminders(
     before: timedelta,
     morning_check: datetime | None,
     name: str,
+    gender: str | None = None,
 ) -> list[Reminder]:
     """Напоминания, которые пора отправить сейчас. Повторы отсекаются по ключу снаружи.
 
@@ -198,7 +217,8 @@ def due_reminders(
     if plan.status == "night" and morning_check and morning_check <= now < morning_check + AT_WINDOW:
         out.append(Reminder(
             f"morning:{morning_check.date().isoformat()}",
-            f"☀️ {name} уже проснулся(ась)? Отметьте подъём, чтобы я рассчитал день.",
+            f"☀️ {name} уже {gendered(gender, 'проснулся', 'проснулась')}? "
+            "Скажите или нажмите «☀️ Проснулись», чтобы я рассчитал день.",
         ))
 
     if plan.status == "nap" and plan.naps:
