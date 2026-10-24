@@ -79,7 +79,7 @@ def test_free_text_records_wake():
     first = calls[0]
     assert first["model"] == "claude-sonnet-5-5"
     assert first["fallbacks"] == "default"
-    assert "Лёва, мальчик" in first["messages"][-1]["content"]
+    assert "Лёва, мальчик" in first["messages"][-1]["content"][-1]["text"]
     tool_result = calls[1]["messages"][-1]["content"][0]
     assert tool_result["tool_use_id"] == "t1" and "проснулся(ась) в 00:01" in tool_result["content"]
     # В памяти диалога — только текст реплик.
@@ -98,7 +98,7 @@ def test_correction_updates_event_by_id():
         ("end_turn", [text("Исправил: уснул вчера в 21:30.")]),
     ])
     reply = say(s, a, "нет, он уснул вчера в 21:30")
-    assert f"#{event_id}" in a.client.beta.messages.calls[0]["messages"][-1]["content"]
+    assert f"#{event_id}" in a.client.beta.messages.calls[0]["messages"][-1]["content"][-1]["text"]
     [event] = s.events(1, datetime(2000, 1, 1, tzinfo=TZ))
     assert event.kind == NIGHT
     assert event.ts.astimezone(TZ) == resolve_time("21:30", "yesterday", datetime.now(TZ))

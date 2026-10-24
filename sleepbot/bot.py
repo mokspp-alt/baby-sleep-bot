@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 from . import onboarding
+from . import attachments
 from .assistant import Assistant, parse_hhmm, resolve_time
 from .parsing import (
     is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
@@ -638,7 +639,8 @@ class ChatTools:
 
 
 async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Chat,
-                                text: str, heard: str) -> bool:
+                                text: str, heard: str, files: list[dict] | None = None,
+                                label: str = "") -> bool:
     """True, если сообщение обработал Claude; False — пусть разбирают правила."""
     assistant: Assistant | None = context.application.bot_data.get("assistant")
     if assistant is None:
@@ -647,7 +649,7 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
     now = datetime.now(tz_of(chat))
     tools = ChatTools(chat, s, now)
     try:
-        reply_text = await assistant.handle(chat.chat_id, text, tools.state(), tools)
+        reply_text = await assistant.handle(chat.chat_id, text, tools.state(), tools, files, label)
     except Exception:
         if not (tools.changed or tools.plan_changed):
             log.exception("Claude недоступен, разбираю сообщение правилами")
@@ -753,6 +755,43 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_text(update, context, text, voice=True)
 
 
+MAX_FILE_BYTES = 20 * 1024 * 1024  # больше Telegram боту не отдаёт
+
+
+async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фото и документы: Claude извлекает данные, анализирует и при необходимости записывает сон."""
+    message = update.effective_message
+    chat = await configured_chat(update, context)
+    if chat is None:
+        return
+    if context.application.bot_data.get("assistant") is None:
+        await message.reply_text("Чтобы разбирать фото и файлы, боту нужен Claude (ANTHROPIC_API_KEY).")
+        return
+    if message.photo:
+        media, name, mime = message.photo[-1], "фото", "image/jpeg"
+    else:
+        media = message.document
+        name, mime = media.file_name or "файл", media.mime_type
+    if (media.file_size or 0) > MAX_FILE_BYTES:
+        await message.reply_text("Файл больше 20 МБ — Telegram не отдаёт боту такие. Пришлите поменьше.")
+        return
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    try:
+        data = bytes(await (await media.get_file()).download_as_bytearray())
+        block = attachments.to_block(name, mime, data)
+    except attachments.UnsupportedFile as e:
+        await message.reply_text(str(e))
+        return
+    except Exception:
+        log.exception("Не удалось скачать файл")
+        await message.reply_text("Не получилось скачать файл. Попробуйте ещё раз.")
+        return
+    text = message.caption or "Посмотри, что здесь, и помоги разобраться."
+    if not await handle_with_assistant(update, context, chat, text, "", [block], name):
+        await message.reply_text("Не получилось разобрать файл: Claude сейчас недоступен. "
+                                 "Попробуйте чуть позже.")
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     s = store(context)
@@ -833,6 +872,7 @@ def main() -> None:
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(tick, interval=60, first=5)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -44,6 +44,15 @@ SYSTEM = """\
   какое время имелось в виду, переспроси, а не записывай наугад.
 - Если просят то, чего бот не умеет, честно скажи об этом.
 
+Фото и файлы (скриншоты других приложений, дневник сна, выписки, анализы, таблицы):
+- Внимательно извлеки данные и кратко перескажи главное; на вопрос в подписи ответь по файлу.
+- Если в файле записи сна: одну-две свежие записи, которые явно нужно отметить, — запиши.
+  Если записей много (журнал за несколько дней), сначала перечисли найденное по дням и
+  спроси, записать ли; после согласия запиши их, указывая день датой.
+- Не выдумывай то, что не видно или не читается, — скажи, что именно разобрать не удалось.
+- Медицинские документы поясняй простыми словами, без диагнозов; значения вне нормы
+  и всё тревожное — повод показать педиатру.
+
 Про режим: план в блоке «Состояние» уже учитывает возраст, длину ночи, реальный дневной сон
 и время, назначенное родителями, — опирайся на него, а не пересчитывай сам. Нормы — это
 ориентир, а не правило. Медицинских диагнозов не ставь; при тревожных симптомах (высокая
@@ -82,7 +91,8 @@ def _tool(name: str, description: str, properties: dict) -> dict:
 
 
 _TIME = {"type": "string", "description": "ЧЧ:ММ по местному времени или \"now\""}
-_DAY = {"type": "string", "enum": ["today", "yesterday"], "description": "К какому дню относится время"}
+_DAY = {"type": "string",
+        "description": "К какому дню относится время: today, yesterday или дата ДД.ММ.ГГГГ"}
 
 TOOLS = [
     _tool("record_event", "Записать, что ребёнок проснулся или уснул.", {
@@ -137,19 +147,20 @@ class Assistant:
         proxy = os.environ.get("ANTHROPIC_PROXY") or os.environ.get("TELEGRAM_PROXY") or None
         return cls(key, proxy)
 
-    async def handle(self, chat_id: int, text: str, state: str, tools) -> str:
+    async def handle(self, chat_id: int, text: str, state: str, tools,
+                     attachments: list[dict] | None = None, label: str = "") -> str:
         """state — описание дня для модели; tools — объект с методами-инструментами
-        (record_event, update_event, …) и state(), работающий с базой бота."""
+        (record_event, update_event, …) и state(), работающий с базой бота.
+        attachments — блоки фото и файлов (attachments.to_block), label — их название для истории."""
         history = self.history.setdefault(chat_id, [])
-        messages = _with_history_breakpoint(history) + [{
-            "role": "user",
-            "content": f"<Состояние>\n{state}\n</Состояние>\n\nСообщение родителя: {text}",
-        }]
+        prompt = f"<Состояние>\n{state}\n</Состояние>\n\nСообщение родителя: {text}"
+        content = [*(attachments or []), {"type": "text", "text": prompt}]
+        messages = _with_history_breakpoint(history) + [{"role": "user", "content": content}]
         extra = {}
         if not self.model.startswith("claude-haiku"):
             # Если модель откажется отвечать, API сам повторит запрос на другой. У Haiku такого нет.
             extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
-        for _ in range(6):
+        for _ in range(10):
             response = await self.client.beta.messages.create(
                 model=self.model,
                 max_tokens=8000,
@@ -172,7 +183,9 @@ class Assistant:
         reply = "\n\n".join(b.text.strip() for b in response.content if b.type == "text").strip()
         reply = reply or "Готово."
         # В памяти держим только текст реплик, без служебного состояния и инструментов.
-        history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
+        # Сами файлы в историю не попадают (дорого), только пометка — найденное есть в ответе.
+        said = f"[{label}] {text}".strip() if label else text
+        history += [{"role": "user", "content": said}, {"role": "assistant", "content": reply}]
         del history[:-HISTORY_TURNS * 2]
         return reply
 
@@ -205,6 +218,14 @@ def resolve_time(time: str, day: str, now: datetime) -> datetime:
     at = now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
     if day == "yesterday":
         at -= timedelta(days=1)
+    elif m := re.fullmatch(r"\s*(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s*", day):
+        year = int(m.group(3)) if m.group(3) else now.year
+        try:
+            at = at.replace(year=year, month=int(m.group(2)), day=int(m.group(1)))
+        except ValueError:
+            raise ValueError(f"нет такой даты «{day}»") from None
+        if not m.group(3) and at > now + timedelta(minutes=5):
+            at = at.replace(year=year - 1)  # «31.12», сказанное в январе
     elif at > now + timedelta(minutes=5):
         at -= timedelta(days=1)  # «уснул в 23:40», сказанное после полуночи
     return at
