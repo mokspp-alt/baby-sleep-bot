@@ -19,7 +19,9 @@ from telegram.ext import (
 )
 
 from . import onboarding
-from .parsing import is_question, parse_birth_date, parse_event, question_topic
+from .parsing import (
+    is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
+)
 from .schedule import (
     NAP, NIGHT, WAKE, AgeNorm, DayPlan, Event, age_in_months, build_plan, classify_sleep,
     due_reminders, format_age, format_duration, gendered, norm_for,
@@ -129,11 +131,47 @@ def plan_text(chat: Chat, plan: DayPlan, now: datetime) -> str:
         return "\n".join(lines)
 
     lines += schedule_lines(plan, norm, tz, now)
+    lines += night_lines(chat, plan, norm)
     if any(n.skipped for n in plan.naps):
         lines.append("\nДневной сон пропущен, поэтому отбой раньше обычного.")
     if plan.status == "awake":
         lines.append(f"\nСейчас бодрствует {format_duration(now - plan.status_since)}.")
     return "\n".join(lines)
+
+
+def night_lines(chat: Chat, plan: DayPlan, norm: AgeNorm) -> list[str]:
+    """Сколько спал ночью и как это сдвинуло день."""
+    if plan.night is None:
+        return [f"\nНе знаю, во сколько {g(chat, 'он уснул', 'она уснула')} вчера. "
+                "Скажите, например, «в 21:15» — учту, сколько длилась ночь."]
+    lines = [f"\nНочью {g(chat, 'спал', 'спала')} {format_duration(plan.night)} "
+             f"(норма {norm.night_hours} ч)."]
+    if plan.nap_shift or plan.bed_shift:
+        moved = []
+        if plan.nap_shift:
+            moved.append(f"дневной сон на {format_duration(plan.nap_shift)} раньше")
+        if plan.bed_shift:
+            moved.append(f"отбой на {format_duration(plan.bed_shift)} раньше")
+        lines.append(f"Ночь короче нормы, {g(chat, 'он', 'она')} устанет раньше: "
+                     + " и ".join(moved) + ".")
+    return lines
+
+
+def night_start_answer(chat: Chat, s: Storage, text: str, now: datetime) -> datetime | None:
+    """«В 21:15» после утреннего подъёма — во сколько ребёнок уснул вчера вечером."""
+    plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+    clock = parse_clock(normalize(text))
+    if plan.morning_wake is None or plan.night is not None or clock is None:
+        return None
+    wake = plan.morning_wake.ts.astimezone(tz_of(chat))
+    hour, minute = clock
+    for h in (hour, hour + 12) if hour < 12 else (hour,):
+        at = wake.replace(hour=h, minute=minute, second=0, microsecond=0)
+        if at >= wake:
+            at -= timedelta(days=1)
+        if timedelta(hours=3) <= wake - at <= timedelta(hours=16):
+            return at
+    return None
 
 
 def answer_question(chat: Chat, s: Storage, text: str, now: datetime) -> str:
@@ -282,6 +320,8 @@ async def handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE, chat:
         await ask(update, chat, chat.setup_step, heard + answer.error + "\n\n")
         return
     updates = dict(answer.updates)
+    if "wake_usual" in updates and not updates["wake_usual"]:
+        updates["morning_check"] = "09:00"  # подъём «по-разному» — спрашиваем попозже
     if wake := updates.get("wake_usual"):
         h, m = map(int, wake.split(":"))
         updates["morning_check"] = f"{h + 1:02d}:{m:02d}"
@@ -464,6 +504,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     if is_question(text) and not (parsed and _PAST_EVENT.search(text)):
         await update.effective_message.reply_text(heard + answer_question(chat, s, text, now),
                                                   reply_markup=KEYBOARD)
+        return
+    if not parsed and (night := night_start_answer(chat, s, text, now)):
+        s.add_event(chat.chat_id, NIGHT, night)
+        plan = build_plan(s.recent(chat.chat_id, now), now, norm_of(chat, now))
+        await update.effective_message.reply_text(
+            heard + f"🌙 Записал: {g(chat, 'уснул', 'уснула')} вчера в {hm(night, tz)}.\n\n"
+            + plan_text(chat, plan, now), reply_markup=KEYBOARD)
         return
     if not parsed:
         if private or voice:

@@ -100,6 +100,7 @@ def test_onboarding_skips_answered_questions():
     assert onboarding.apply("wake", "в семь утра", {}, today, now).updates == {"wake_usual": "07:00"}
     assert onboarding.apply("wake", "полвосьмого", {}, today, now).updates == {"wake_usual": "07:30"}
     assert onboarding.apply("wake", "не помню", {}, today, now).error  # переспросим
+    assert onboarding.apply("wake", "По-разному.", {}, today, now).updates == {"wake_usual": None}
 
 
 # --- сквозной диалог -------------------------------------------------------------------
@@ -152,3 +153,22 @@ def test_dialog_from_setup_to_question():
 
     say(s, "уснул")
     assert s.last_event(1).kind in (NAP, NIGHT)
+
+
+def test_dialog_wake_varies_and_night_answer():
+    s = Storage(":memory:")
+    for answer in ("привет", "Лёва", "мальчик", "2 года", "один раз"):
+        say(s, answer)
+    assert "городе" in say(s, "По-разному.", voice=True)
+    assert s.chat(1).wake_usual is None and s.chat(1).morning_check == "09:00"
+    say(s, "Москва")
+    assert s.chat(1).configured
+
+    reply = say(s, "проснулся в 7:10")
+    assert "Не знаю, во сколько он уснул вчера" in reply
+    reply = say(s, "в 21:15", voice=True)
+    assert "Записал: уснул вчера в 21:15" in reply
+    assert "Ночью спал 9 ч 55 мин" in reply
+    assert "дневной сон на 10 мин раньше и отбой на 10 мин раньше" in reply
+    kinds = [e.kind for e in s.events(1, at(0, 0, day=1))]
+    assert kinds == [NIGHT, WAKE]

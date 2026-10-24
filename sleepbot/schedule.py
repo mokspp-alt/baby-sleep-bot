@@ -21,24 +21,29 @@ class AgeNorm:
     wake_windows: tuple[float, ...]
     naps: tuple[float, ...]
     nap_max: float  # после этого дневной сон лучше прервать, чтобы не сбить ночь
-    night_hours: str
+    night_min: float  # нормальная длина ночного сна, часы
+    night_max: float
 
     def __post_init__(self) -> None:
         assert len(self.wake_windows) == len(self.naps) + 1
+
+    @property
+    def night_hours(self) -> str:
+        return f"{self.night_min:g}–{self.night_max:g}".replace(".", ",")
 
 
 # Усреднённые рекомендации педиатров и сомнологов. У каждого ребёнка свой ритм:
 # это стартовая точка, а не правило.
 NORMS: tuple[AgeNorm, ...] = (
-    AgeNorm(4, (1.75, 2.0, 2.0, 2.25), (1.25, 1.25, 0.5), 2.0, "11–12"),
-    AgeNorm(6, (2.5, 2.75, 3.0), (1.5, 1.25), 2.0, "11–12"),
-    AgeNorm(9, (3.0, 3.25, 3.75), (1.5, 1.25), 2.0, "11–12"),
-    AgeNorm(12, (3.25, 3.75, 4.0), (1.5, 1.0), 2.0, "11–12"),
-    AgeNorm(15, (5.0, 4.5), (2.25,), 3.0, "11–12"),
-    AgeNorm(18, (5.25, 4.75), (2.0,), 2.75, "11–12"),
-    AgeNorm(24, (5.5, 5.0), (1.75,), 2.5, "10.5–11.5"),
-    AgeNorm(36, (6.0, 5.5), (1.25,), 1.75, "10.5–11.5"),
-    AgeNorm(48, (12.5,), (), 0.0, "10–11"),
+    AgeNorm(4, (1.75, 2.0, 2.0, 2.25), (1.25, 1.25, 0.5), 2.0, 11, 12),
+    AgeNorm(6, (2.5, 2.75, 3.0), (1.5, 1.25), 2.0, 11, 12),
+    AgeNorm(9, (3.0, 3.25, 3.75), (1.5, 1.25), 2.0, 11, 12),
+    AgeNorm(12, (3.25, 3.75, 4.0), (1.5, 1.0), 2.0, 11, 12),
+    AgeNorm(15, (5.0, 4.5), (2.25,), 3.0, 11, 12),
+    AgeNorm(18, (5.25, 4.75), (2.0,), 2.75, 11, 12),
+    AgeNorm(24, (5.5, 5.0), (1.75,), 2.5, 10.5, 11.5),
+    AgeNorm(36, (6.0, 5.5), (1.25,), 1.75, 10.5, 11.5),
+    AgeNorm(48, (12.5,), (), 0.0, 10, 11),
 )
 
 
@@ -107,6 +112,9 @@ class DayPlan:
     morning_wake: Event | None = None
     naps: list[PlannedNap] = field(default_factory=list)
     bedtime: datetime | None = None
+    night: timedelta | None = None  # сколько спал прошлой ночью
+    nap_shift: timedelta = timedelta(0)  # насколько раньше дневной сон из-за короткой ночи
+    bed_shift: timedelta = timedelta(0)  # насколько раньше отбой из-за короткой ночи
 
 
 # Если запланированный сон не начался спустя столько времени — считаем его пропущенным.
@@ -148,9 +156,17 @@ def build_plan(events: list[Event], now: datetime, norm: AgeNorm) -> DayPlan:
         wake = next((w for w in day[i + 1:] if w.kind == WAKE), None)
         actual.append(PlannedNap(e.ts, wake.ts if wake else e.ts, True, wake is not None, event_id=e.id))
 
+    if night_idx >= 0 and events[night_idx].ts < plan.morning_wake.ts:
+        night = plan.morning_wake.ts - events[night_idx].ts
+        if timedelta(hours=3) <= night <= timedelta(hours=16):
+            plan.night = night
+            plan.nap_shift, plan.bed_shift = night_shifts(night, norm)
+
     cursor = plan.morning_wake.ts
     for i in range(max(len(norm.naps), len(actual))):
         window = _hours(norm.wake_windows[min(i, len(norm.wake_windows) - 1)])
+        if i == 0:
+            window -= plan.nap_shift
         duration = _hours(norm.naps[min(i, len(norm.naps) - 1)]) if norm.naps else timedelta(hours=1)
         if i < len(actual):
             nap = actual[i]
@@ -165,8 +181,27 @@ def build_plan(events: list[Event], now: datetime, norm: AgeNorm) -> DayPlan:
         plan.naps.append(nap)
         cursor = nap.end
 
-    plan.bedtime = cursor + _hours(norm.wake_windows[-1])
+    plan.bedtime = cursor + _hours(norm.wake_windows[-1]) - plan.bed_shift
     return plan
+
+
+def _round5(minutes: float) -> timedelta:
+    return timedelta(minutes=5 * round(minutes / 5))
+
+
+def night_shifts(night: timedelta, norm: AgeNorm) -> tuple[timedelta, timedelta]:
+    """Недоспал ночью — устаёт раньше: первое окно бодрствования и вечернее окно короче.
+
+    За каждый час недосыпа: дневной сон на 20 мин раньше (не больше часа),
+    отбой на 15 мин раньше (не больше 45 мин). Недосып меньше 15 минут не считаем.
+    Если дневного сна нет, сдвигаем только отбой.
+    """
+    deficit = norm.night_min - night.total_seconds() / 3600
+    if deficit < 0.25:
+        return timedelta(0), timedelta(0)
+    nap = _round5(min(deficit * 20, 60)) if norm.naps else timedelta(0)
+    bed = _round5(min(deficit * 15, 45))
+    return nap, bed
 
 
 def classify_sleep(events: list[Event], at: datetime, norm: AgeNorm, local_hour: int) -> str:

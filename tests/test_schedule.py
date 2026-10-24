@@ -115,3 +115,21 @@ def test_parse_event():
 def test_parse_birth_date():
     assert parse_birth_date("Миша 12.03.2024") == date(2024, 3, 12)
     assert parse_birth_date("Миша") is None
+
+
+def test_short_night_moves_day_earlier():
+    # Норма в 2 года — от 10,5 ч; ночь 22:30–07:00 = 8,5 ч, недосып 2 ч.
+    events = [ev(1, NIGHT, at(22, 30, 23)), ev(2, WAKE, at(7, 0))]
+    plan = build_plan(events, at(8), NORM_2Y)
+    assert plan.night == timedelta(hours=8, minutes=30)
+    assert plan.nap_shift == timedelta(minutes=40)
+    assert plan.bed_shift == timedelta(minutes=30)
+    assert plan.naps[0].start == at(11, 50)  # вместо 12:30
+    assert plan.bedtime == at(18, 5)  # 11:50 + 1:45 сна + 5 ч − 30 мин
+
+
+def test_normal_night_keeps_day():
+    events = [ev(1, NIGHT, at(20, 0, 23)), ev(2, WAKE, at(7, 0))]
+    plan = build_plan(events, at(8), NORM_2Y)
+    assert plan.night == timedelta(hours=11)
+    assert plan.nap_shift == plan.bed_shift == timedelta(0)

@@ -64,8 +64,9 @@ def question(step: str, name: str | None, gender: str | None) -> Question:
                         "например: 12.03.2024"),
         "naps": Question(f"Сколько раз в день {he} сейчас спит днём?",
                          ["Не спит днём", "1 раз", "2 раза", "Не знаю"]),
-        "wake": Question(f"Во сколько {he} обычно просыпается утром?",
-                         ["6:30", "7:00", "7:30", "8:00"]),
+        "wake": Question(f"Во сколько {he} обычно просыпается утром? Если по-разному — "
+                         "так и скажите: день всё равно считаю от настоящего подъёма.",
+                         ["6:30", "7:00", "7:30", "8:00", "По-разному"]),
         "city": Question("В каком городе вы живёте? Это нужно для часового пояса.",
                          ["Москва", "Санкт-Петербург", "Екатеринбург", "Новосибирск"]),
         "localtime": Question("Не знаю этот город. Сколько у вас сейчас времени? Например: 14:35"),
@@ -134,7 +135,9 @@ def apply(step: str, text: str, filled: dict, today: date, now_utc: datetime) ->
             err = "Сколько раз днём? Например: «один раз» или «не спит днём»."
     elif step == "wake":
         clock = parse_clock(normalize(text)) or _bare_hour(text)
-        if clock and 4 <= clock[0] <= 11:
+        if re.search(r"по.?разному|разн|когда как|не знаю", text, re.I):
+            updates["wake_usual"] = None
+        elif clock and 4 <= clock[0] <= 11:
             updates["wake_usual"] = f"{clock[0]:02d}:{clock[1]:02d}"
         else:
             err = "Во сколько обычно подъём? Например: 7:00"
