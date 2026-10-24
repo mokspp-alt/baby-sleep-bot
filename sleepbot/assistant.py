@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 HISTORY_TURNS = 10  # сколько последних обменов репликами помнить
 
+
 SYSTEM = """\
 Ты — заботливый помощник родителей в Telegram-боте, который ведёт сон ребёнка.
 Родители пишут или говорят голосом (текст — расшифровка речи, в ней бывают ошибки).
@@ -51,6 +52,22 @@ SYSTEM = """\
 Без markdown: Telegram покажет звёздочки как есть. Называй ребёнка по имени и согласуй слова
 с его полом. Время пиши как 8:20. После изменений коротко подтверди, что сделал.
 """
+
+# Кэш запросов (prompt caching). Инструкции и инструменты не меняются и одинаковы для всех
+# чатов — держим их час: родители пишут с перерывами. Историю и хвост запроса — 5 минут:
+# они пригодятся, если сообщения идут подряд, и внутри одного ответа, где бот вызывает
+# инструменты и делает несколько запросов подряд.
+CACHED_SYSTEM = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+
+
+def _with_history_breakpoint(history: list[dict]) -> list[dict]:
+    """Копия истории с меткой кэша на последней реплике; сама история не меняется."""
+    if not history:
+        return []
+    last = history[-1]
+    marked = {"role": last["role"], "content": [
+        {"type": "text", "text": last["content"], "cache_control": {"type": "ephemeral"}}]}
+    return history[:-1] + [marked]
 
 
 def _tool(name: str, description: str, properties: dict) -> dict:
@@ -121,7 +138,7 @@ class Assistant:
         """state — описание дня для модели; tools — объект с методами-инструментами
         (record_event, update_event, …) и state(), работающий с базой бота."""
         history = self.history.setdefault(chat_id, [])
-        messages = history + [{
+        messages = _with_history_breakpoint(history) + [{
             "role": "user",
             "content": f"<Состояние>\n{state}\n</Состояние>\n\nСообщение родителя: {text}",
         }]
@@ -129,9 +146,10 @@ class Assistant:
             response = await self.client.beta.messages.create(
                 model=MODEL,
                 max_tokens=8000,
-                system=SYSTEM,
+                system=CACHED_SYSTEM,
                 tools=TOOLS,
                 messages=messages,
+                cache_control={"type": "ephemeral"},  # хвост: переиспользуется в цикле инструментов
                 output_config={"effort": "low"},
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",

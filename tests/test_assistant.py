@@ -167,3 +167,24 @@ def test_resolve_time():
     assert resolve_time("23:40", "today", now) == datetime(2026, 10, 23, 23, 40, tzinfo=TZ)
     assert resolve_time("8:05", "yesterday", now) == datetime(2026, 10, 23, 8, 5, tzinfo=TZ)
     assert resolve_time("now", "today", now) == now
+
+
+def test_cache_breakpoints():
+    s = configured_storage()
+    a = fake_assistant([
+        ("end_turn", [text("Привет!")]),
+        ("end_turn", [text("Отбой около 19:15.")]),
+    ])
+    say(s, a, "привет")
+    say(s, a, "когда отбой?")
+    first, second = a.client.beta.messages.calls
+    # Инструкции и инструменты — на час, одинаковые для всех запросов.
+    assert first["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert first["system"] == second["system"]
+    # Хвост запроса — автоматический кэш на 5 минут.
+    assert first["cache_control"] == {"type": "ephemeral"}
+    # Во втором сообщении метка стоит на конце истории, а сама история не изменилась.
+    last_history = second["messages"][1]
+    assert last_history["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert last_history["content"][0]["text"] == "Привет!"
+    assert a.history[1][1] == {"role": "assistant", "content": "Привет!"}
