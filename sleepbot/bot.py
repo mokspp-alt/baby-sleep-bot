@@ -566,7 +566,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     token = os.environ["BOT_TOKEN"]
-    app = Application.builder().token(token).concurrent_updates(True).post_init(preload_model).build()
+    builder = Application.builder().token(token).concurrent_updates(True).post_init(preload_model)
+    # Если api.telegram.org с сервера недоступен — через прокси: http://… или socks5://user:pass@host:port
+    if proxy := os.environ.get("TELEGRAM_PROXY"):
+        builder = builder.proxy(proxy).get_updates_proxy(proxy)
+    app = builder.build()
     app.bot_data["storage"] = Storage(os.environ.get("DB_PATH", "sleep.db"))
     app.bot_data["stt"] = Transcriber()
 
