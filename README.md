@@ -49,12 +49,22 @@ Telegram-бот для учёта сна ребёнка. Родители гов
    python -m venv .venv && .venv/bin/pip install -r requirements.txt
    BOT_TOKEN=... .venv/bin/python -m sleepbot
    ```
-3. Или в Docker:
+3. На сервере через PM2 (Ubuntu 22.04+, Python 3.10+):
+   ```bash
+   git clone <url репозитория> baby-sleep-bot && cd baby-sleep-bot
+   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+   mkdir -p data && cp .env.example .env && nano .env   # вписать BOT_TOKEN
+   pm2 start ecosystem.config.js && pm2 save
+   pm2 logs baby-sleep-bot
+   ```
+   Обновление: `git pull && .venv/bin/pip install -r requirements.txt && pm2 restart baby-sleep-bot`.
+   Бот работает через long polling, поэтому ему не нужны ни порт, ни домен, ни nginx.
+4. Или в Docker:
    ```bash
    docker build -t baby-sleep-bot .
    docker run -d --restart=always --name sleepbot -e BOT_TOKEN=... -v sleepdata:/data baby-sleep-bot
    ```
-4. Напишите боту `/start`, затем имя и дату рождения: `Миша 12.03.2024`.
+5. Напишите боту `/start` и ответьте на вопросы анкеты — голосом или текстом.
 
 Голосовые распознаются прямо на сервере моделью Whisper
 ([faster-whisper](https://github.com/SYSTRAN/faster-whisper)), ключи и платные API не нужны.
@@ -65,6 +75,7 @@ Telegram-бот для учёта сна ребёнка. Родители гов
 Бот должен работать постоянно, иначе напоминания не придут. Подойдёт любой VPS или
 сервис, где можно запустить Docker-контейнер с постоянным диском для `/data`
 (в базе SQLite хранится история).
+`.env` подхватывается автоматически, если лежит в корне проекта.
 
 ### Для двоих родителей
 

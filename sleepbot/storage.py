@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -64,6 +65,8 @@ def _utc(ts: datetime) -> str:
 
 class Storage:
     def __init__(self, path: str) -> None:
+        if path != ":memory:" and os.path.dirname(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
