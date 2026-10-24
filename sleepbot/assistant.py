@@ -17,6 +17,7 @@ import anthropic
 log = logging.getLogger(__name__)
 
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
 HISTORY_TURNS = 10  # сколько последних обменов репликами помнить
 
 
@@ -120,7 +121,9 @@ TOOLS = [
 
 
 class Assistant:
-    def __init__(self, api_key: str, proxy: str | None = None) -> None:
+    def __init__(self, api_key: str, proxy: str | None = None, model: str = MODEL,
+                 effort: str = EFFORT) -> None:
+        self.model, self.effort = model, effort
         http_client = anthropic.DefaultAsyncHttpxClient(proxy=proxy) if proxy else None
         self.client = anthropic.AsyncAnthropic(api_key=api_key, http_client=http_client,
                                                timeout=90.0)
@@ -142,17 +145,20 @@ class Assistant:
             "role": "user",
             "content": f"<Состояние>\n{state}\n</Состояние>\n\nСообщение родителя: {text}",
         }]
+        extra = {}
+        if not self.model.startswith("claude-haiku"):
+            # Если модель откажется отвечать, API сам повторит запрос на другой. У Haiku такого нет.
+            extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
         for _ in range(6):
             response = await self.client.beta.messages.create(
-                model=MODEL,
+                model=self.model,
                 max_tokens=8000,
                 system=CACHED_SYSTEM,
                 tools=TOOLS,
                 messages=messages,
                 cache_control={"type": "ephemeral"},  # хвост: переиспользуется в цикле инструментов
-                output_config={"effort": "low"},
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
+                output_config={"effort": self.effort},
+                **extra,
             )
             if response.stop_reason == "refusal":
                 raise RuntimeError("Claude отказался отвечать")

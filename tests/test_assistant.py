@@ -38,6 +38,7 @@ class FakeMessages:
 def fake_assistant(responses):
     a = Assistant.__new__(Assistant)
     a.history = {}
+    a.model, a.effort = "claude-sonnet-5-5", "low"
     a.client = SimpleNamespace(beta=SimpleNamespace(messages=FakeMessages(responses)))
     return a
 
