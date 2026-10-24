@@ -49,7 +49,12 @@ Telegram-бот для учёта сна ребёнка. Родители гов
    python -m venv .venv && .venv/bin/pip install -r requirements.txt
    BOT_TOKEN=... .venv/bin/python -m sleepbot
    ```
-3. На сервере через PM2 (Ubuntu 22.04+, Python 3.10+):
+3. На сервере с PM2 одной командой (Ubuntu 22.04+, Python 3.10+). Повторный запуск без
+   токена обновляет бота:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/mokspp-alt/baby-sleep-bot/main/deploy/install.sh | BOT_TOKEN=... bash
+   ```
+   То же вручную:
    ```bash
    git clone <url репозитория> baby-sleep-bot && cd baby-sleep-bot
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
