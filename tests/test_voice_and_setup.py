@@ -184,3 +184,54 @@ def test_error_handler_tells_the_user():
     asyncio.run(bot.on_error(update, SimpleNamespace(error=TimeoutError("proxy"))))
     assert "Повторите" in sent[0]
     asyncio.run(bot.on_error(None, SimpleNamespace(error=TimeoutError("proxy"))))  # без сообщения — молча
+
+
+def run_voice(media_kind, duration, transcript):
+    s = Storage(":memory:")
+    s.update_chat(1, child_name="Лёва", gender="m", birth_date=date(2024, 11, 20))
+    sent, actions = [], []
+
+    async def reply_text(text, reply_markup=None):
+        sent.append(text)
+
+    async def send_chat_action(chat_id, action):
+        actions.append(action)
+
+    async def get_file():
+        async def download_to_drive(path):
+            open(path, "wb").close()
+        return SimpleNamespace(download_to_drive=download_to_drive)
+
+    class STT:
+        async def transcribe(self, path):
+            await asyncio.sleep(0.05)
+            if isinstance(transcript, Exception):
+                raise transcript
+            return transcript
+
+    media = SimpleNamespace(duration=duration, get_file=get_file)
+    message = SimpleNamespace(voice=None, audio=None, video_note=None, reply_text=reply_text)
+    setattr(message, media_kind, media)
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=1, type="private"),
+                             effective_message=message)
+    context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=send_chat_action),
+                              application=SimpleNamespace(bot_data={"storage": s, "stt": STT()}))
+    asyncio.run(bot.on_voice(update, context))
+    return s, sent, actions
+
+
+def test_long_voice_gets_ack_and_typing():
+    s, sent, actions = run_voice("voice", 45, "Проснулся")
+    assert sent[0].startswith("🎧 Слушаю") and "Лёва проснулся" in sent[1]
+    assert actions  # «печатает…» включался
+    assert s.last_event(1).kind == WAKE
+
+
+def test_video_note_is_recognized():
+    s, sent, _ = run_voice("video_note", 8, "Уснул")
+    assert len(sent) == 1 and "🎤 «Уснул»" in sent[0]
+
+
+def test_failed_transcription_answers():
+    _, sent, _ = run_voice("voice", 5, RuntimeError("whisper"))
+    assert sent == ["Не получилось распознать голосовое 😕 Повторите или напишите текстом."]

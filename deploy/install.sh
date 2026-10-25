@@ -59,11 +59,11 @@ if ! command -v pm2 >/dev/null 2>&1; then
     echo "!! pm2 не найден. Установите: npm install -g pm2" >&2
     exit 1
 fi
+# Пересоздаём только процесс бота: так применяются и изменения ecosystem.config.js.
 if pm2 describe "$NAME" >/dev/null 2>&1; then
-    pm2 restart "$NAME" --update-env
-else
-    pm2 start ecosystem.config.js
+    pm2 delete "$NAME" >/dev/null
 fi
+pm2 start ecosystem.config.js
 pm2 save
 sleep 5
 pm2 logs "$NAME" --lines 20 --nostream

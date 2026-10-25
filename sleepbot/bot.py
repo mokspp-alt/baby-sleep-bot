@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -827,24 +829,49 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await handle_text(update, context, update.effective_message.text or "")
 
 
+@contextlib.asynccontextmanager
+async def typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """«Печатает…» всё время обработки: Telegram гасит индикатор через ~5 секунд."""
+    async def keep() -> None:
+        while True:
+            with contextlib.suppress(Exception):
+                await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+            await asyncio.sleep(4)
+
+    task = asyncio.create_task(keep())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+LONG_VOICE = 20  # секунд: о таких голосовых предупреждаем, что понадобится время
+
+
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Голосовые, аудиофайлы и «кружочки»: распознаём речь и обрабатываем как текст."""
     message = update.effective_message
-    media = message.voice or message.audio
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "voice.ogg")
-        try:
-            file = await media.get_file()
-            await file.download_to_drive(path)
-            text = await context.application.bot_data["stt"].transcribe(path)
-        except Exception:
-            log.exception("Не удалось распознать голосовое")
-            await message.reply_text("Не получилось распознать голосовое 😕 Напишите текстом.")
+    media = message.voice or message.audio or message.video_note
+    duration = getattr(media, "duration", 0) or 0
+    if duration > LONG_VOICE:
+        await message.reply_text("🎧 Слушаю, это займёт немного времени…")
+    started = time.monotonic()
+    async with typing(context, update.effective_chat.id):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "voice")
+            try:
+                file = await media.get_file()
+                await file.download_to_drive(path)
+                text = await context.application.bot_data["stt"].transcribe(path)
+            except Exception:
+                log.exception("Не удалось распознать голосовое (%s с)", duration)
+                await message.reply_text("Не получилось распознать голосовое 😕 Повторите или напишите текстом.")
+                return
+        log.info("Голосовое %s с распознано за %.1f с", duration, time.monotonic() - started)
+        if not text:
+            await message.reply_text("Не расслышал. Повторите, пожалуйста.")
             return
-    if not text:
-        await message.reply_text("Не расслышал. Повторите, пожалуйста.")
-        return
-    await handle_text(update, context, text, voice=True)
+        await handle_text(update, context, text, voice=True)
 
 
 MAX_FILE_BYTES = 20 * 1024 * 1024  # больше Telegram боту не отдаёт
@@ -1042,7 +1069,7 @@ def main() -> None:
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_error_handler(on_error)
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.job_queue.run_repeating(tick, interval=60, first=5)

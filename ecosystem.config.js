@@ -8,7 +8,7 @@ module.exports = {
       args: "-m sleepbot",
       interpreter: "none",
       autorestart: true,
-      max_memory_restart: "1500M",
+      max_memory_restart: "2500M",  // модель распознавания речи занимает ~1 ГБ, с запасом на пики
       env: { PYTHONUNBUFFERED: "1" },
     },
   ],
