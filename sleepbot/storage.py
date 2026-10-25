@@ -36,6 +36,20 @@ CREATE TABLE IF NOT EXISTS overrides (
     ts TEXT NOT NULL,
     PRIMARY KEY (chat_id, day_id, target)
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    chat_id INTEGER NOT NULL,
+    sleep_id INTEGER NOT NULL,
+    mood TEXT,
+    latency INTEGER,
+    wakings INTEGER,
+    PRIMARY KEY (chat_id, sleep_id)
+);
+CREATE TABLE IF NOT EXISTS unusual_days (
+    chat_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY (chat_id, day)
+);
 CREATE TABLE IF NOT EXISTS sent (
     chat_id INTEGER NOT NULL,
     key TEXT NOT NULL,
@@ -44,7 +58,11 @@ CREATE TABLE IF NOT EXISTS sent (
 """
 
 # Колонки, добавленные после первой версии, — для баз, созданных раньше.
-MIGRATIONS = {"gender": "TEXT", "naps_pref": "INTEGER", "wake_usual": "TEXT", "setup_step": "TEXT"}
+MIGRATIONS = {
+    "gender": "TEXT", "naps_pref": "INTEGER", "wake_usual": "TEXT", "setup_step": "TEXT",
+    "adj_nap": "INTEGER NOT NULL DEFAULT 0", "adj_bed": "INTEGER NOT NULL DEFAULT 0",
+    "last_review": "TEXT", "pending": "TEXT",
+}
 FIELDS = {"child_name", "birth_date", "tz", "remind_before", "morning_check", *MIGRATIONS}
 
 
@@ -60,6 +78,10 @@ class Chat:
     naps_pref: int | None = None  # сколько раз спит днём по словам родителей
     wake_usual: str | None = None  # обычный подъём, "07:00"
     setup_step: str | None = None  # текущий вопрос анкеты
+    adj_nap: int = 0  # личная поправка окна бодрствования перед дневным сном, минуты
+    adj_bed: int = 0  # личная поправка окна перед ночным сном, минуты
+    last_review: str | None = None  # дата последнего еженедельного разбора
+    pending: str | None = None  # предложение разбора, ждущее ответа (JSON)
 
     @property
     def configured(self) -> bool:
@@ -92,6 +114,7 @@ class Storage:
             date.fromisoformat(r["birth_date"]) if r["birth_date"] else None,
             r["tz"], r["remind_before"], r["morning_check"],
             r["gender"], r["naps_pref"], r["wake_usual"], r["setup_step"],
+            r["adj_nap"], r["adj_bed"], r["last_review"], r["pending"],
         )
 
     def chats(self) -> list[Chat]:
@@ -162,6 +185,35 @@ class Storage:
     def overrides(self, chat_id: int) -> dict:
         rows = self.db.execute("SELECT day_id, target, ts FROM overrides WHERE chat_id = ?", (chat_id,))
         return {(r["day_id"], r["target"]): datetime.fromisoformat(r["ts"]) for r in rows}
+
+    def set_feedback(self, chat_id: int, sleep_id: int, **fields) -> None:
+        """mood ("good" / "ok" / "bad"), latency (минут до засыпания), wakings (ночных пробуждений)."""
+        self.db.execute("INSERT OR IGNORE INTO feedback (chat_id, sleep_id) VALUES (?, ?)",
+                        (chat_id, sleep_id))
+        for name, value in fields.items():
+            assert name in {"mood", "latency", "wakings"}
+            self.db.execute(f"UPDATE feedback SET {name} = ? WHERE chat_id = ? AND sleep_id = ?",
+                            (value, chat_id, sleep_id))
+        self.db.commit()
+
+    def feedback(self, chat_id: int) -> dict[int, dict]:
+        rows = self.db.execute("SELECT * FROM feedback WHERE chat_id = ?", (chat_id,))
+        return {r["sleep_id"]: {"mood": r["mood"], "latency": r["latency"], "wakings": r["wakings"]}
+                for r in rows}
+
+    def set_unusual_day(self, chat_id: int, day: date, reason: str | None) -> None:
+        """Особый день (болезнь, зубы, поездка) — не учитывать в выводах. reason=None — снять."""
+        if reason is None:
+            self.db.execute("DELETE FROM unusual_days WHERE chat_id = ? AND day = ?",
+                            (chat_id, day.isoformat()))
+        else:
+            self.db.execute("INSERT OR REPLACE INTO unusual_days VALUES (?, ?, ?)",
+                            (chat_id, day.isoformat(), reason))
+        self.db.commit()
+
+    def unusual_days(self, chat_id: int) -> dict[date, str]:
+        rows = self.db.execute("SELECT day, reason FROM unusual_days WHERE chat_id = ?", (chat_id,))
+        return {date.fromisoformat(r["day"]): r["reason"] for r in rows}
 
     def mark_sent(self, chat_id: int, key: str) -> bool:
         """True, если напоминание с этим ключом ещё не отправлялось."""

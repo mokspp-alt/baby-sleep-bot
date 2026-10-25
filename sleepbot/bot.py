@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import (
@@ -24,6 +25,7 @@ from .assistant import Assistant, parse_hhmm, resolve_time
 from .parsing import (
     is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
 )
+from .learning import MOODS, REVIEW_EVERY, Proposal, personal_norm, review, samples
 from .schedule import (
     NAP, NIGHT, WAKE, AgeNorm, DayPlan, Event, age_in_months, build_plan, classify_sleep,
     due_reminders, format_age, format_duration, gendered, norm_for,
@@ -72,8 +74,14 @@ def tz_of(chat: Chat):
     return ZoneInfo(chat.tz)
 
 
-def norm_of(chat: Chat, now: datetime) -> AgeNorm:
+def base_norm(chat: Chat, now: datetime) -> AgeNorm:
+    """Возрастная норма (с учётом числа дневных снов), без личных поправок."""
     return norm_for(age_in_months(chat.birth_date, now.date()), chat.naps_pref)
+
+
+def norm_of(chat: Chat, now: datetime) -> AgeNorm:
+    """Норма с личными поправками окон бодрствования, которые родители приняли после разборов."""
+    return personal_norm(base_norm(chat, now), chat.adj_nap, chat.adj_bed)
 
 
 def hm(dt: datetime, tz) -> str:
@@ -273,8 +281,37 @@ def week_text(chat: Chat, s: Storage, now: datetime) -> str:
     return "\n".join(lines)
 
 
-def event_keyboard(event: Event) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(f"−{m} мин", callback_data=f"adj:{event.id}:{m}") for m in (5, 10, 15, 30)]]
+def sleep_of(event: Event, s: Storage, chat_id: int) -> Event | None:
+    """Сон, к которому относится отзыв: сама отметка сна или сон перед этим подъёмом."""
+    if event.kind in (NAP, NIGHT):
+        return event
+    before = [e for e in s.events(chat_id, since=event.ts - timedelta(hours=18)) if e.ts < event.ts]
+    return before[-1] if before and before[-1].kind in (NAP, NIGHT) else None
+
+
+def feedback_rows(event: Event, s: Storage, chat_id: int) -> list[list[InlineKeyboardButton]]:
+    sleep = sleep_of(event, s, chat_id)
+    if sleep is None:
+        return []
+    fb = s.feedback(chat_id).get(sleep.id, {})
+
+    def button(label: str, field: str, value) -> InlineKeyboardButton:
+        mark = "✓ " if fb.get(field) == value else ""
+        return InlineKeyboardButton(mark + label, callback_data=f"fb:{event.id}:{field}={value}")
+
+    if event.kind in (NAP, NIGHT):
+        return [[button("Уснул за ≤10 мин", "latency", 5), button("10–30", "latency", 20),
+                 button("30+ мин", "latency", 40)]]
+    rows = [[button(f"{icon}", "mood", mood) for mood, icon in MOODS.items()]]
+    if sleep.kind == NIGHT:
+        rows.append([button("Ночью: 0", "wakings", 0), button("1", "wakings", 1),
+                     button("2+", "wakings", 2)])
+    return rows
+
+
+def event_keyboard(event: Event, s: Storage, chat_id: int) -> InlineKeyboardMarkup:
+    rows = feedback_rows(event, s, chat_id)
+    rows.append([InlineKeyboardButton(f"−{m} мин", callback_data=f"adj:{event.id}:{m}") for m in (5, 10, 15, 30)])
     if event.kind == NAP:
         rows.append([InlineKeyboardButton("Это ночной сон", callback_data=f"kind:{event.id}:{NIGHT}")])
     elif event.kind == NIGHT:
@@ -620,6 +657,37 @@ class ChatTools:
         self.plan_changed = True
         return f"Настройка {setting} = {v} сохранена."
 
+    def record_feedback(self, sleep_event_id: int, mood: str, fall_asleep_minutes: int,
+                        night_wakings: int) -> str:
+        sleep = self.s.event(self.chat.chat_id, sleep_event_id)
+        if not sleep or sleep.kind not in (NAP, NIGHT):
+            raise ValueError(f"#{sleep_event_id} — не отметка сна")
+        fields = {}
+        if mood in MOODS:
+            fields["mood"] = mood
+        if fall_asleep_minutes >= 0:
+            fields["latency"] = min(fall_asleep_minutes, 240)
+        if night_wakings >= 0:
+            fields["wakings"] = min(night_wakings, 20)
+        if not fields:
+            raise ValueError("нечего записывать")
+        self.s.set_feedback(self.chat.chat_id, sleep_event_id, **fields)
+        return f"Отзыв о сне #{sleep_event_id} записан: {fields}."
+
+    def mark_unusual_day(self, day: str, reason: str) -> str:
+        when = resolve_time("12:00", day, self.now).date()
+        if reason.strip().lower() == "none":
+            self.s.set_unusual_day(self.chat.chat_id, when, None)
+            return f"{when:%d.%m} снова учитывается в выводах."
+        self.s.set_unusual_day(self.chat.chat_id, when, reason.strip()[:100])
+        return f"{when:%d.%m} отмечен особым днём ({reason}) — в выводах о режиме не учитывается."
+
+    def answer_review(self, accept: bool) -> str:
+        result = answer_review(self.s, self.chat, accept)
+        self.chat = self.s.chat(self.chat.chat_id)
+        self.plan_changed = accept
+        return result
+
     def state(self) -> str:
         chat, tz, now = self.chat, self.tz, self.now
         months = age_in_months(chat.birth_date, now.date())
@@ -638,6 +706,26 @@ class ChatTools:
         lines.append("Отметки за полтора дня: " + ("; ".join(
             f"#{e.id} {e.ts.astimezone(tz):%d.%m %H:%M} {self.KINDS[e.kind]}" for e in events)
             or "нет") + ".")
+        feedback = self.s.feedback(chat.chat_id)
+        notes = []
+        for e in events:
+            if fb := feedback.get(e.id):
+                parts = [f"засыпал {fb['latency']} мин" if fb["latency"] is not None else "",
+                         f"после сна {MOODS[fb['mood']]}" if fb["mood"] else "",
+                         f"ночных пробуждений {fb['wakings']}" if fb["wakings"] is not None else ""]
+                notes.append(f"#{e.id}: " + ", ".join(p for p in parts if p))
+        if notes:
+            lines.append("Отзывы о снах: " + "; ".join(notes) + ".")
+        unusual = {d: r for d, r in self.s.unusual_days(chat.chat_id).items()
+                   if now.date() - d <= timedelta(days=14)}
+        if unusual:
+            lines.append("Особые дни (не учитываются в выводах): "
+                         + "; ".join(f"{d:%d.%m} {r}" for d, r in sorted(unusual.items())) + ".")
+        lines.append(f"Личные поправки окон бодрствования: перед дневным сном {chat.adj_nap:+d} мин, "
+                     f"перед ночным {chat.adj_bed:+d} мин.")
+        if chat.pending:
+            lines.append("Ждёт ответа родителей предложение из разбора недели: "
+                         + " ".join(p["text"] for p in json.loads(chat.pending)))
         lines.append(plan_text(chat, day_plan(chat, self.s, now), now))
         return "\n".join(lines)
 
@@ -668,7 +756,7 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
         chat = s.chat(chat.chat_id)
         reply += "\n\n" + plan_text(chat, day_plan(chat, s, now), now)
     await update.effective_message.reply_text(
-        reply, reply_markup=event_keyboard(event) if event else KEYBOARD)
+        reply, reply_markup=event_keyboard(event, s, chat.chat_id) if event else KEYBOARD)
     return True
 
 
@@ -731,7 +819,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     event_id = s.add_event(chat.chat_id, kind, parsed.at)
     event = s.event(chat.chat_id, event_id)
     await update.effective_message.reply_text(
-        heard + event_text(chat, s, event, now), reply_markup=event_keyboard(event)
+        heard + event_text(chat, s, event, now), reply_markup=event_keyboard(event, s, chat.chat_id)
     )
 
 
@@ -801,6 +889,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     s = store(context)
     chat = s.chat(update.effective_chat.id)
     action, event_id, arg = query.data.split(":")
+    if action == "rev":
+        await query.answer()
+        await query.edit_message_text(query.message.text + "\n\n" + answer_review(s, chat, arg == "yes"))
+        return
     event = s.event(chat.chat_id, int(event_id))
     if not event:
         await query.answer("Эта отметка уже удалена")
@@ -812,13 +904,67 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("Удалено")
         await query.edit_message_text(f"Отметка в {hm(event.ts, tz)} удалена.")
         return
+    if action == "fb":
+        field, value = arg.split("=")
+        sleep = sleep_of(event, s, chat.chat_id)
+        if sleep is None:
+            await query.answer("Не нашёл сон, к которому это относится")
+            return
+        s.set_feedback(chat.chat_id, sleep.id, **{field: value if field == "mood" else int(value)})
+        await query.answer("Записал, спасибо!")
+        await query.edit_message_reply_markup(event_keyboard(event, s, chat.chat_id))
+        return
     if action == "adj":
         s.update_event(chat.chat_id, event.id, ts=event.ts - timedelta(minutes=int(arg)))
     elif action == "kind" and arg in (NAP, NIGHT):
         s.update_event(chat.chat_id, event.id, kind=arg)
     event = s.event(chat.chat_id, event.id)
     await query.answer()
-    await query.edit_message_text(event_text(chat, s, event, now), reply_markup=event_keyboard(event))
+    await query.edit_message_text(event_text(chat, s, event, now),
+                                  reply_markup=event_keyboard(event, s, chat.chat_id))
+
+
+def weekly_review(chat: Chat, s: Storage, now: datetime) -> tuple[str, bool] | None:
+    """Текст разбора и есть ли в нём предложения; None — разбирать пока рано или нечего."""
+    if chat.last_review and now.date() - date.fromisoformat(chat.last_review) < REVIEW_EVERY:
+        return None
+    tz = tz_of(chat)
+    events = s.events(chat.chat_id, since=now - timedelta(days=15))
+    items = samples(events, s.feedback(chat.chat_id), set(s.unusual_days(chat.chat_id)), tz)
+    if not items or now - min(i.start for i in items) < REVIEW_EVERY:
+        return None  # первые выводы — не раньше чем через неделю отзывов
+    result = review(items, now, base_norm(chat, now), chat.adj_nap, chat.adj_bed,
+                    chat.child_name, chat.gender)
+    if not result.proposals and not result.summary:
+        return None
+    s.update_chat(chat.chat_id, last_review=now.date().isoformat(),
+                  pending=json.dumps([p.__dict__ for p in result.proposals]) if result.proposals else None)
+    lines = [f"📊 Разбор недели — как {chat.child_name} засыпает и просыпается:"]
+    lines += [f"• {line}" for line in result.summary]
+    lines += [f"• {p.text}" for p in result.proposals]
+    if result.proposals:
+        lines.append("\nПрименить?")
+    return "\n".join(lines), bool(result.proposals)
+
+
+def answer_review(s: Storage, chat: Chat, accept: bool) -> str:
+    if not chat.pending:
+        return "Это предложение уже неактуально."
+    proposals = [Proposal(**p) for p in json.loads(chat.pending)]
+    s.update_chat(chat.chat_id, pending=None)
+    if not accept:
+        return "Хорошо, оставляю режим как есть."
+    adj = {"nap": chat.adj_nap, "bed": chat.adj_bed}
+    for p in proposals:
+        adj[p.target] += p.delta
+    s.update_chat(chat.chat_id, adj_nap=adj["nap"], adj_bed=adj["bed"])
+    return "✓ Применил. Новый режим — с ближайшего дня; через неделю посмотрю, стало ли лучше."
+
+
+REVIEW_BUTTONS = InlineKeyboardMarkup([[
+    InlineKeyboardButton("Да, сдвинуть", callback_data="rev:0:yes"),
+    InlineKeyboardButton("Нет, оставить", callback_data="rev:0:no"),
+]])
 
 
 async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -839,6 +985,10 @@ async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
                                    check, chat.child_name, chat.gender):
                 if s.mark_sent(chat.chat_id, r.key):
                     await context.bot.send_message(chat.chat_id, r.text, reply_markup=KEYBOARD)
+            if now.hour >= 10 and plan.status == "awake" and (weekly := weekly_review(chat, s, now)):
+                text, ask = weekly
+                await context.bot.send_message(chat.chat_id, text,
+                                               reply_markup=REVIEW_BUTTONS if ask else KEYBOARD)
         except Exception:
             log.exception("Напоминание для чата %s не отправлено", chat.chat_id)
 
