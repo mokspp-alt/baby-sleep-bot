@@ -166,12 +166,33 @@ def parse_event(text: str, now: datetime) -> Parsed | None:
 # --- анкета -------------------------------------------------------------------------
 
 
+_MONTHS = {
+    "январ": 1, "янв": 1, "феврал": 2, "фев": 2, "март": 3, "мар": 3, "апрел": 4, "апр": 4,
+    "мая": 5, "май": 5, "июн": 6, "июл": 7, "август": 8, "авг": 8, "сентябр": 9, "сен": 9,
+    "октябр": 10, "окт": 10, "ноябр": 11, "ноя": 11, "декабр": 12, "дек": 12,
+}
+
+
+def _month(word: str) -> int | None:
+    word = word.lower()
+    for stem in sorted(_MONTHS, key=len, reverse=True):  # «март» раньше «мар»
+        if word.startswith(stem):
+            return _MONTHS[stem]
+    return None
+
+
 def parse_birth_date(text: str) -> date | None:
-    m = re.search(r"(\d{1,2})[./-](\d{1,2})[./-](\d{4})", text)
-    if not m:
+    """«12.03.2024», «12.03.24», «27 октября 2024», «27-го окт. 2024 года»."""
+    day = month = year = None
+    if m := re.search(r"(?<!\d)(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})(?!\d)", text):
+        day, month, year = int(m.group(1)), int(m.group(2)), m.group(3)
+    elif m := re.search(r"(?<!\d)(\d{1,2})(?:-?го)?\s+([а-яё]+)\.?,?\s+(\d{4}|\d{2})(?!\d)", text, re.I):
+        day, month, year = int(m.group(1)), _month(m.group(2)), m.group(3)
+    if not day or not month:
         return None
+    year = int(year) + (2000 if len(year) == 2 else 0)
     try:
-        return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        return date(year, month, day)
     except ValueError:
         return None
 

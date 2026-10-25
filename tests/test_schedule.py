@@ -115,6 +115,13 @@ def test_parse_event():
 def test_parse_birth_date():
     assert parse_birth_date("Миша 12.03.2024") == date(2024, 3, 12)
     assert parse_birth_date("Миша") is None
+    assert parse_birth_date("27 октября 2024") == date(2024, 10, 27)
+    assert parse_birth_date("родился 3-го марта 2025 года") == date(2025, 3, 3)
+    assert parse_birth_date("1 мая 2024") == date(2024, 5, 1)
+    assert parse_birth_date("15 окт. 2024") == date(2024, 10, 15)
+    assert parse_birth_date("27.10.24") == date(2024, 10, 27)
+    assert parse_birth_date("31 февраля 2024") is None
+    assert parse_birth_date("2 года") is None
 
 
 def test_short_night_moves_day_earlier():

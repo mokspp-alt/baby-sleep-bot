@@ -235,3 +235,9 @@ def test_video_note_is_recognized():
 def test_failed_transcription_answers():
     _, sent, _ = run_voice("voice", 5, RuntimeError("whisper"))
     assert sent == ["Не получилось распознать голосовое 😕 Повторите или напишите текстом."]
+
+
+def test_onboarding_accepts_month_names():
+    a = onboarding.apply("age", "27 октября 2024", {}, date(2026, 10, 25),
+                         datetime(2026, 10, 25, 17, 0, tzinfo=timezone.utc))
+    assert a.updates["birth_date"] == date(2024, 10, 27) and a.error is None
