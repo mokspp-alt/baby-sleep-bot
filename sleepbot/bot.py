@@ -17,6 +17,7 @@ from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update,
 )
 from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
@@ -1015,7 +1016,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if sleep is None:
             await query.answer("Не нашёл сон, к которому это относится")
             return
-        s.set_feedback(chat.chat_id, sleep.id, **{field: value if field == "mood" else int(value)})
+        value = value if field == "mood" else int(value)
+        if s.feedback(chat.chat_id).get(sleep.id, {}).get(field) == value:
+            await query.answer("Уже отмечено ✓")  # повторное нажатие: менять нечего
+            return
+        s.set_feedback(chat.chat_id, sleep.id, **{field: value})
         await query.answer("Записал, спасибо!")
         await query.edit_message_reply_markup(event_keyboard(event, s, chat.chat_id))
         return
@@ -1074,7 +1079,14 @@ REVIEW_BUTTONS = InlineKeyboardMarkup([[
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Любая ошибка в обработчике: пишем в лог и говорим человеку, а не молчим."""
+    if isinstance(context.error, BadRequest) and "not modified" in str(context.error).lower():
+        return  # кнопку нажали повторно — сообщение и так в нужном виде
     log.error("Ошибка при обработке сообщения", exc_info=context.error)
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        with contextlib.suppress(Exception):
+            await query.answer("😕 Не получилось, попробуйте ещё раз")
+        return
     message = getattr(update, "effective_message", None)
     if message is None:
         return

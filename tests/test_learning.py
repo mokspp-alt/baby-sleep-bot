@@ -136,3 +136,49 @@ def test_feedback_buttons():
     sleep = s.event(1, sleep_id)
     labels = [b.text for b in bot.event_keyboard(sleep, s, 1).inline_keyboard[0]]
     assert labels == ["Уснул за ≤10 мин", "10–30", "30+ мин"]
+
+
+
+def test_pressing_same_feedback_twice_does_not_edit():
+    s = Storage(":memory:")
+    s.update_chat(1, child_name="Лёва", gender="m", birth_date=date(2024, 11, 20))
+    sleep = s.event(1, s.add_event(1, NIGHT, at(25, 20, 30)))
+    answers, edits = [], []
+
+    async def answer(text=None):
+        answers.append(text)
+
+    async def edit_message_reply_markup(markup):
+        edits.append(markup)
+
+    def press():
+        query = SimpleNamespace(data=f"fb:{sleep.id}:latency=20", answer=answer,
+                                edit_message_reply_markup=edit_message_reply_markup)
+        update = SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=1))
+        asyncio.run(bot.on_button(update, SimpleNamespace(application=SimpleNamespace(
+            bot_data={"storage": s}))))
+
+    press()
+    press()
+    assert answers == ["Записал, спасибо!", "Уже отмечено ✓"] and len(edits) == 1
+
+
+def test_error_on_button_shows_toast_not_message():
+    from telegram.error import BadRequest
+
+    toasts, sent = [], []
+
+    async def answer(text=None):
+        toasts.append(text)
+
+    async def reply_text(text, reply_markup=None):
+        sent.append(text)
+
+    update = SimpleNamespace(callback_query=SimpleNamespace(answer=answer),
+                             effective_message=SimpleNamespace(reply_text=reply_text))
+    asyncio.run(bot.on_error(update, SimpleNamespace(error=RuntimeError("сбой"))))
+    assert toasts == ["😕 Не получилось, попробуйте ещё раз"] and sent == []
+
+    asyncio.run(bot.on_error(update, SimpleNamespace(
+        error=BadRequest("Message is not modified: specified new message content is the same"))))
+    assert len(toasts) == 1  # «не изменилось» молча игнорируем
