@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
 HISTORY_TURNS = 10  # сколько последних обменов репликами помнить
+SILENT = "—"  # так модель отвечает в группе, когда сообщение не к ней
 
 
 SYSTEM = """\
@@ -173,12 +174,21 @@ class Assistant:
         return cls(key, proxy)
 
     async def handle(self, chat_id: int, text: str, state: str, tools,
-                     attachments: list[dict] | None = None, label: str = "") -> str:
+                     attachments: list[dict] | None = None, label: str = "",
+                     group: bool = False, addressed: bool = False, author: str = "") -> str:
         """state — описание дня для модели; tools — объект с методами-инструментами
         (record_event, update_event, …) и state(), работающий с базой бота.
-        attachments — блоки фото и файлов (attachments.to_block), label — их название для истории."""
+        attachments — блоки фото и файлов (attachments.to_block), label — их название для истории.
+        group — общий чат родителей: там модель может промолчать, тогда вернётся пустая строка."""
         history = self.history.setdefault(chat_id, [])
-        prompt = f"<Состояние>\n{state}\n</Состояние>\n\nСообщение родителя: {text}"
+        prompt = f"<Состояние>\n{state}\n</Состояние>\n\n"
+        if group:
+            prompt += f"Это общий чат родителей, пишет {author or 'один из родителей'}. "
+            prompt += ("Сообщение обращено к тебе — ответь.\n" if addressed else
+                       "Родители переписываются и между собой. Если сообщение не обращено к тебе "
+                       "и в нём нет ни сведений о сне или самочувствии ребёнка, ни вопроса к тебе, "
+                       f"ничего не делай и ответь ровно «{SILENT}».\n")
+        prompt += f"Сообщение родителя: {text}"
         content = [*(attachments or []), {"type": "text", "text": prompt}]
         messages = _with_history_breakpoint(history) + [{"role": "user", "content": content}]
         extra = {}
@@ -206,6 +216,8 @@ class Assistant:
             ]})
 
         reply = "\n\n".join(b.text.strip() for b in response.content if b.type == "text").strip()
+        if group and reply.strip(" .") in (SILENT, "-", "–"):
+            return ""  # не к боту — молчим и не засоряем историю
         reply = reply or "Готово."
         # В памяти держим только текст реплик, без служебного состояния и инструментов.
         # Сами файлы в историю не попадают (дорого), только пометка — найденное есть в ответе.

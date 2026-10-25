@@ -189,3 +189,60 @@ def test_cache_breakpoints():
     assert last_history["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert last_history["content"][0]["text"] == "Привет!"
     assert a.history[1][1] == {"role": "assistant", "content": "Привет!"}
+
+
+def say_in_group(s, a, msg, reply_to_bot=False):
+    sent = []
+
+    async def reply_text(t, reply_markup=None):
+        sent.append(t)
+
+    me = SimpleNamespace(id=999, username="BabysleepBot")
+    replied = SimpleNamespace(from_user=SimpleNamespace(id=999)) if reply_to_bot else None
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=1, type="group"),
+        effective_user=SimpleNamespace(first_name="Аня"),
+        effective_message=SimpleNamespace(text=msg, caption=None, reply_to_message=replied,
+                                          reply_text=reply_text))
+    context = SimpleNamespace(bot=me, application=SimpleNamespace(
+        bot_data={"storage": s, "assistant": a}))
+    asyncio.run(bot.handle_text(update, context, msg))
+    return sent
+
+
+def test_group_chatter_is_ignored():
+    s = configured_storage()
+    a = fake_assistant([("end_turn", [text("—")])])
+    assert say_in_group(s, a, "купи молоко по дороге") == []
+    prompt = a.client.beta.messages.calls[0]["messages"][-1]["content"][-1]["text"]
+    assert "пишет Аня" in prompt and "ответь ровно «—»" in prompt
+    assert a.history[1] == []  # болтовня не попадает в память
+
+
+def test_group_sleep_news_and_direct_questions_are_answered():
+    s = configured_storage()
+    a = fake_assistant([
+        ("tool_use", [tool_use("t1", "record_event", kind="wake", time="now", day="today")]),
+        ("end_turn", [text("Записал подъём.")]),
+        ("end_turn", [text("Отбой около 19:15.")]),
+    ])
+    assert say_in_group(s, a, "Лёва проснулся")[0].startswith("Записал подъём.")
+    assert say_in_group(s, a, "а когда отбой?", reply_to_bot=True) == ["Отбой около 19:15."]
+    prompt = a.client.beta.messages.calls[-1]["messages"][-1]["content"][-1]["text"]
+    assert "обращено к тебе — ответь" in prompt
+
+
+def test_group_photo_without_caption_is_skipped():
+    downloads = []
+
+    async def get_file():
+        downloads.append(1)
+
+    message = SimpleNamespace(photo=[SimpleNamespace(file_size=1, get_file=get_file)], document=None,
+                              caption=None, text=None, reply_to_message=None)
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=1, type="supergroup"),
+                             effective_message=message)
+    context = SimpleNamespace(bot=SimpleNamespace(id=999, username="BabysleepBot"),
+                              application=SimpleNamespace(bot_data={}))
+    asyncio.run(bot.on_file(update, context))
+    assert downloads == []

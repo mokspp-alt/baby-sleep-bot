@@ -732,6 +732,23 @@ class ChatTools:
         return "\n".join(lines)
 
 
+def is_group(update: Update) -> bool:
+    return update.effective_chat.type != "private"
+
+
+def is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """В группе: сообщение с упоминанием @бота или ответ на сообщение бота."""
+    message = update.effective_message
+    me = getattr(context, "bot", None)
+    username = getattr(me, "username", None)
+    text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").lower()
+    if username and f"@{username.lower()}" in text:
+        return True
+    replied = getattr(message, "reply_to_message", None)
+    sender = getattr(replied, "from_user", None)
+    return bool(sender and me and sender.id == getattr(me, "id", None))
+
+
 async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Chat,
                                 text: str, heard: str, files: list[dict] | None = None,
                                 label: str = "") -> bool:
@@ -743,7 +760,10 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
     now = datetime.now(tz_of(chat))
     tools = ChatTools(chat, s, now)
     try:
-        reply_text = await assistant.handle(chat.chat_id, text, tools.state(), tools, files, label)
+        user = getattr(update, "effective_user", None)
+        reply_text = await assistant.handle(
+            chat.chat_id, text, tools.state(), tools, files, label, group=is_group(update),
+            addressed=is_addressed(update, context), author=getattr(user, "first_name", "") or "")
     except Exception:
         if not (tools.changed or tools.plan_changed):
             log.exception("Claude недоступен, разбираю сообщение правилами")
@@ -751,6 +771,8 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
         # Изменения уже внесены — повторный разбор правилами записал бы их второй раз.
         log.exception("Claude оборвался после изменений")
         reply_text = "Изменения внесены, но ответ не получился. Проверьте план ниже."
+    if not reply_text and not (tools.changed or tools.plan_changed):
+        return True  # в группе сообщение было не боту
     reply = heard + reply_text
     events = [e for e in (s.event(chat.chat_id, i) for i in reversed(tools.changed)) if e]
     event = events[0] if events else None
@@ -853,7 +875,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     media = message.voice or message.audio or message.video_note
     duration = getattr(media, "duration", 0) or 0
-    if duration > LONG_VOICE:
+    if duration > LONG_VOICE and not is_group(update):
         await message.reply_text("🎧 Слушаю, это займёт немного времени…")
     started = time.monotonic()
     async with typing(context, update.effective_chat.id):
@@ -880,6 +902,8 @@ MAX_FILE_BYTES = 20 * 1024 * 1024  # больше Telegram боту не отд�
 async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Фото и документы: Claude извлекает данные, анализирует и при необходимости записывает сон."""
     message = update.effective_message
+    if is_group(update) and not message.caption and not is_addressed(update, context):
+        return  # в общем чате без подписи это, скорее всего, просто фото для родителей
     chat = await configured_chat(update, context)
     if chat is None:
         return
