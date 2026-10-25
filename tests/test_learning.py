@@ -52,7 +52,7 @@ def test_review_suggests_earlier_when_overtired_and_respects_limit():
     [p] = review(items, at(24, 10), NORM, 0, 0, "Маша", "f").proposals
     assert (p.target, p.delta) == ("bed", -15) and "переутомление" in p.text
 
-    capped = review(items, at(24, 10), NORM, 0, -45, "Маша", "f")
+    capped = review(items, at(24, 10), NORM, 0, -90, "Маша", "f")
     assert capped.proposals == [] and "предельная" in capped.summary[0]
 
 
