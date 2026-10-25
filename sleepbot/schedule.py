@@ -204,18 +204,24 @@ def _round5(minutes: float) -> timedelta:
 
 
 def night_shifts(night: timedelta, norm: AgeNorm) -> tuple[timedelta, timedelta]:
-    """Недоспал ночью — устаёт раньше: первое окно бодрствования и вечернее окно короче.
+    """Насколько раньше (плюс) или позже (минус) сдвинуть дневной сон и отбой из-за ночи.
 
-    За каждый час недосыпа: дневной сон на 20 мин раньше (не больше часа),
-    отбой на 15 мин раньше (не больше 45 мин). Недосып меньше 15 минут не считаем.
-    Если дневного сна нет, сдвигаем только отбой.
+    Недоспал — устаёт раньше: за каждый час недосыпа дневной сон на 20 мин раньше
+    (не больше часа), отбой на 15 мин раньше (не больше 45 мин).
+    Проспал больше нормы — может бодрствовать чуть дольше, но эффект слабее: за каждый
+    час сверх нормы оба сдвигаются на 15 мин позже, не больше чем на полчаса.
+    Разницу меньше 15 минут не считаем. Если дневного сна нет, сдвигаем только отбой.
     """
-    deficit = norm.night_min - night.total_seconds() / 3600
-    if deficit < 0.25:
+    hours = night.total_seconds() / 3600
+    deficit = norm.night_min - hours
+    surplus = hours - norm.night_max
+    if deficit >= 0.25:
+        nap, bed = _round5(min(deficit * 20, 60)), _round5(min(deficit * 15, 45))
+    elif surplus >= 0.25:
+        nap = bed = -_round5(min(surplus * 15, 30))
+    else:
         return timedelta(0), timedelta(0)
-    nap = _round5(min(deficit * 20, 60)) if norm.naps else timedelta(0)
-    bed = _round5(min(deficit * 15, 45))
-    return nap, bed
+    return (nap if norm.naps else timedelta(0)), bed
 
 
 def classify_sleep(events: list[Event], at: datetime, norm: AgeNorm, local_hour: int) -> str:

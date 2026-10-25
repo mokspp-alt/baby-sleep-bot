@@ -154,14 +154,18 @@ def night_lines(chat: Chat, plan: DayPlan, norm: AgeNorm) -> list[str]:
                 "Скажите, например, «в 21:15» — учту, сколько длилась ночь."]
     lines = [f"\nНочью {g(chat, 'спал', 'спала')} {format_duration(plan.night)} "
              f"(норма {norm.night_hours} ч)."]
-    if plan.nap_shift or plan.bed_shift:
-        moved = []
-        if plan.nap_shift:
-            moved.append(f"дневной сон на {format_duration(plan.nap_shift)} раньше")
-        if plan.bed_shift:
-            moved.append(f"отбой на {format_duration(plan.bed_shift)} раньше")
-        lines.append(f"Ночь короче нормы, {g(chat, 'он', 'она')} устанет раньше: "
-                     + " и ".join(moved) + ".")
+    nap_ahead = any(not n.started and not n.skipped for n in plan.naps)
+    moved = []
+    if plan.nap_shift and nap_ahead:
+        moved.append(f"дневной сон на {format_duration(abs(plan.nap_shift))} "
+                     + ("раньше" if plan.nap_shift > timedelta(0) else "позже"))
+    if plan.bed_shift:
+        moved.append(f"отбой на {format_duration(abs(plan.bed_shift))} "
+                     + ("раньше" if plan.bed_shift > timedelta(0) else "позже"))
+    if moved:
+        why = (f"Ночь короче нормы, {g(chat, 'он', 'она')} устанет раньше" if plan.bed_shift > timedelta(0)
+               else f"Ночь длиннее нормы, {g(chat, 'он', 'она')} может бодрствовать чуть дольше")
+        lines.append(f"{why}: " + " и ".join(moved) + ".")
     return lines
 
 

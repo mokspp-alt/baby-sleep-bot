@@ -142,3 +142,19 @@ def test_manual_times_override_plan():
     assert plan.manual == {"nap0", "bed"}
     # Время на другой день не применяется.
     assert build_plan(events, at(8), NORM_2Y, {(99, "bed"): at(20, 0)}).bedtime == at(19, 15)
+
+
+def test_long_night_moves_day_later():
+    # Сегодняшний случай: 1 год 11 мес. (норма ночи 11–12 ч), ночь 19:33–08:30 = 12 ч 57 мин,
+    # короткий дневной сон 13:15–14:21.
+    norm = norm_for_age(23)
+    events = [ev(1, NIGHT, at(19, 33, 23)), ev(2, WAKE, at(8, 30)),
+              ev(3, NAP, at(13, 15)), ev(4, WAKE, at(14, 21))]
+    plan = build_plan(events, at(19, 0), norm)
+    assert plan.night == timedelta(hours=12, minutes=57)
+    assert plan.bed_shift == plan.nap_shift == -timedelta(minutes=15)
+    assert plan.bedtime == at(19, 21)  # было 19:06
+
+    # Очень длинная ночь сдвигает не больше чем на полчаса.
+    plan = build_plan([ev(1, NIGHT, at(18, 0, 23)), ev(2, WAKE, at(9, 0))], at(10), norm)
+    assert plan.bed_shift == -timedelta(minutes=30)

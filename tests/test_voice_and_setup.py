@@ -169,6 +169,6 @@ def test_dialog_wake_varies_and_night_answer():
     reply = say(s, "в 21:15", voice=True)
     assert "Записал: уснул вчера в 21:15" in reply
     assert "Ночью спал 9 ч 55 мин" in reply
-    assert "дневной сон на 10 мин раньше и отбой на 10 мин раньше" in reply
+    assert "отбой на 10 мин раньше" in reply  # про дневной сон — только если он ещё впереди
     kinds = [e.kind for e in s.events(1, at(0, 0, day=1))]
     assert kinds == [NIGHT, WAKE]
