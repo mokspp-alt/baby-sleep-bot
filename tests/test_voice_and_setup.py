@@ -172,3 +172,15 @@ def test_dialog_wake_varies_and_night_answer():
     assert "отбой на 10 мин раньше" in reply  # про дневной сон — только если он ещё впереди
     kinds = [e.kind for e in s.events(1, at(0, 0, day=1))]
     assert kinds == [NIGHT, WAKE]
+
+
+def test_error_handler_tells_the_user():
+    sent = []
+
+    async def reply_text(text, reply_markup=None):
+        sent.append(text)
+
+    update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply_text))
+    asyncio.run(bot.on_error(update, SimpleNamespace(error=TimeoutError("proxy"))))
+    assert "Повторите" in sent[0]
+    asyncio.run(bot.on_error(None, SimpleNamespace(error=TimeoutError("proxy"))))  # без сообщения — молча

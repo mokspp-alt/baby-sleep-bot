@@ -967,6 +967,19 @@ REVIEW_BUTTONS = InlineKeyboardMarkup([[
 ]])
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Любая ошибка в обработчике: пишем в лог и говорим человеку, а не молчим."""
+    log.error("Ошибка при обработке сообщения", exc_info=context.error)
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+    try:
+        await message.reply_text("😕 Что-то пошло не так, сообщение не обработалось. "
+                                 "Повторите, пожалуйста.")
+    except Exception:
+        log.exception("Не удалось сообщить об ошибке")
+
+
 async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     s = store(context)
     for chat in s.chats():
@@ -1002,7 +1015,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     token = os.environ["BOT_TOKEN"]
-    builder = Application.builder().token(token).concurrent_updates(True).post_init(preload_model)
+    builder = (Application.builder().token(token).concurrent_updates(True).post_init(preload_model)
+               # Связь с Telegram идёт через прокси: 5 секунд по умолчанию иногда не хватает.
+               .connect_timeout(15).read_timeout(30).write_timeout(30).pool_timeout(15)
+               .get_updates_connect_timeout(15).get_updates_read_timeout(30))
     # Если api.telegram.org с сервера недоступен — через прокси: http://… или socks5://user:pass@host:port
     if proxy := os.environ.get("TELEGRAM_PROXY"):
         builder = builder.proxy(proxy).get_updates_proxy(proxy)
@@ -1025,6 +1041,7 @@ def main() -> None:
     app.add_handler(CommandHandler("week", week_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_error_handler(on_error)
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
