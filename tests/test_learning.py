@@ -115,7 +115,7 @@ def test_feedback_buttons():
     wake = s.event(1, s.add_event(1, WAKE, at(24, 7)))
 
     labels = [[b.text for b in row] for row in bot.event_keyboard(wake, s, 1).inline_keyboard]
-    assert labels[0] == ["😊", "😐", "😫"] and labels[1] == ["Ночью: 0", "1", "2+"]
+    assert labels == [["Отменить"]]  # кнопок отзыва под новыми сообщениями больше нет
 
     answers, markups = [], []
 
@@ -130,12 +130,9 @@ def test_feedback_buttons():
     update = SimpleNamespace(callback_query=query, effective_chat=SimpleNamespace(id=1))
     asyncio.run(bot.on_button(update, SimpleNamespace(application=SimpleNamespace(
         bot_data={"storage": s}))))
+    # Кнопки отзыва на старых сообщениях продолжают работать.
     assert s.feedback(1)[sleep_id]["mood"] == "bad"
-    assert markups[0].inline_keyboard[0][2].text == "✓ 😫"
-
-    sleep = s.event(1, sleep_id)
-    labels = [b.text for b in bot.event_keyboard(sleep, s, 1).inline_keyboard[0]]
-    assert labels == ["Уснул за ≤10 мин", "10–30", "30+ мин"]
+    assert [[b.text for b in row] for row in markups[0].inline_keyboard] == [["Отменить"]]
 
 
 

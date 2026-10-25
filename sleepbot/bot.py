@@ -52,8 +52,8 @@ HELP = (
     "Говорите голосовым или пишите:\n"
     "• «проснулся», «проснулась в 6:50», «уснул 10 минут назад», «легли на ночь в 20:15»\n"
     "• «когда спать?», «во сколько отбой?», «сколько он спал?»\n"
-    "Можно и кнопками внизу. Дневной это сон или ночной, я определяю сам; если ошибся — "
-    "поправьте кнопкой под сообщением.\n\n"
+    "Можно и кнопками внизу. Дневной это сон или ночной, я определяю сам; если ошибся или время "
+    "неточное — просто скажите, например «уснул не в 20:45, а в 20:30».\n\n"
     "Команды:\n"
     "/plan — план на сегодня\n"
     "/today — сон за сутки\n"
@@ -295,35 +295,10 @@ def sleep_of(event: Event, s: Storage, chat_id: int) -> Event | None:
     return before[-1] if before and before[-1].kind in (NAP, NIGHT) else None
 
 
-def feedback_rows(event: Event, s: Storage, chat_id: int) -> list[list[InlineKeyboardButton]]:
-    sleep = sleep_of(event, s, chat_id)
-    if sleep is None:
-        return []
-    fb = s.feedback(chat_id).get(sleep.id, {})
-
-    def button(label: str, field: str, value) -> InlineKeyboardButton:
-        mark = "✓ " if fb.get(field) == value else ""
-        return InlineKeyboardButton(mark + label, callback_data=f"fb:{event.id}:{field}={value}")
-
-    if event.kind in (NAP, NIGHT):
-        return [[button("Уснул за ≤10 мин", "latency", 5), button("10–30", "latency", 20),
-                 button("30+ мин", "latency", 40)]]
-    rows = [[button(f"{icon}", "mood", mood) for mood, icon in MOODS.items()]]
-    if sleep.kind == NIGHT:
-        rows.append([button("Ночью: 0", "wakings", 0), button("1", "wakings", 1),
-                     button("2+", "wakings", 2)])
-    return rows
-
-
 def event_keyboard(event: Event, s: Storage, chat_id: int) -> InlineKeyboardMarkup:
-    rows = feedback_rows(event, s, chat_id)
-    rows.append([InlineKeyboardButton(f"−{m} мин", callback_data=f"adj:{event.id}:{m}") for m in (5, 10, 15, 30)])
-    if event.kind == NAP:
-        rows.append([InlineKeyboardButton("Это ночной сон", callback_data=f"kind:{event.id}:{NIGHT}")])
-    elif event.kind == NIGHT:
-        rows.append([InlineKeyboardButton("Это дневной сон", callback_data=f"kind:{event.id}:{NAP}")])
-    rows.append([InlineKeyboardButton("Отменить", callback_data=f"del:{event.id}")])
-    return InlineKeyboardMarkup(rows)
+    """Под отметкой — только «Отменить»: время, тип сна и отзывы поправляются словами через Claude.
+    Кнопки старых сообщений (сдвиг времени, тип сна, отзывы) по-прежнему обрабатываются в on_button."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data=f"del:{event.id}")]])
 
 
 def event_text(chat: Chat, s: Storage, event: Event, now: datetime) -> str:
