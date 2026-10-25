@@ -5,6 +5,8 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from sleepbot import bot
 from sleepbot.assistant import Assistant, resolve_time
 from sleepbot.schedule import NIGHT, WAKE
@@ -156,12 +158,56 @@ def test_api_failure_falls_back_to_rules():
     assert [e.kind for e in s.events(1, datetime(2000, 1, 1, tzinfo=TZ))] == [WAKE]
 
 
-def test_buttons_skip_claude():
+def test_buttons_go_through_claude_with_rule_fallback():
     s = configured_storage()
-    a = fake_assistant([])
-    say(s, a, bot.BTN_WAKE)
-    assert a.client.beta.messages.calls == []
+    a = fake_assistant([
+        ("tool_use", [tool_use("t1", "record_event", kind="wake", time="now", day="today")]),
+        ("end_turn", [text("Доброе утро! Записал подъём.")]),
+    ])
+    assert say(s, a, bot.BTN_WAKE).startswith("Доброе утро!")
+    assert "☀️ Проснулись" in a.client.beta.messages.calls[0]["messages"][-1]["content"][-1]["text"]
 
+    broken = fake_assistant([ConnectionError("нет сети")])
+    assert "проснулся в" in say(s, broken, bot.BTN_WAKE)  # без Claude — по правилам
+
+
+def test_setup_conversation_with_claude():
+    s = Storage(":memory:")
+    a = fake_assistant([
+        ("end_turn", [text("Привет! Я помогу вести сон малыша. Как зовут ребёнка?")]),
+        ("tool_use", [tool_use("t1", "update_settings", setting="child_name", value="Лёва"),
+                      tool_use("t2", "update_settings", setting="gender", value="m"),
+                      tool_use("t3", "update_settings", setting="birth_date", value="27.10.2024")]),
+        ("end_turn", [text("Записал. В каком городе вы живёте?")]),
+        ("tool_use", [tool_use("t4", "update_settings", setting="timezone", value="Europe/Moscow"),
+                      tool_use("t5", "update_settings", setting="usual_wake", value="none"),
+                      tool_use("t6", "finish_setup")]),
+        ("end_turn", [text("Готово! Лёве почти год и 12 месяцев, буду считать сон по возрасту.")]),
+    ])
+    assert "Как зовут" in say(s, a, "/start")
+    calls = a.client.beta.messages.calls
+    assert [t["name"] for t in calls[0]["tools"]] == ["update_settings", "finish_setup"]
+    assert "Анкета ещё не заполнена" in calls[0]["messages"][-1]["content"][-1]["text"]
+    assert "имя: не указано" in calls[0]["messages"][-1]["content"][-1]["text"]
+
+    say(s, a, "Лёва, мальчик, родился 27 октября 2024")
+    assert not s.chat(1).configured
+    reply = say(s, a, "Москва, встаёт по-разному")
+    chat = s.chat(1)
+    assert chat.configured and chat.morning_check == "09:00" and chat.wake_usual is None
+    assert reply.startswith("Готово!") and "📅 План на сегодня — Лёва" in reply
+    finish = calls[-1]["messages"][-1]["content"][-1]
+    assert "Анкета заполнена" in finish["content"]
+
+
+def test_finish_setup_requires_basics():
+    s = Storage(":memory:")
+    s.update_chat(1, child_name="Лёва", setup_step="name")
+    tools = bot.ChatTools(s.chat(1), s, datetime.now(TZ))
+    with pytest.raises(ValueError, match="пол, дата рождения"):
+        tools.finish_setup()
+    tools.update_settings("age_months", "24")
+    assert s.chat(1).birth_date is not None
 
 def test_resolve_time():
     now = datetime(2026, 10, 24, 0, 20, tzinfo=TZ)

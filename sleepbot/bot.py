@@ -25,7 +25,7 @@ from . import onboarding
 from . import attachments
 from .assistant import Assistant, parse_hhmm, resolve_time
 from .parsing import (
-    is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
+    birth_date_from_age, is_question, normalize, parse_birth_date, parse_clock, parse_event, question_topic,
 )
 from .learning import MOODS, REVIEW_EVERY, Proposal, personal_norm, review, samples
 from .schedule import (
@@ -415,6 +415,9 @@ def setup_summary(chat: Chat) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = store(context).chat(update.effective_chat.id)
+    if not chat.configured and context.application.bot_data.get("assistant"):
+        await handle_text(update, context, "/start")  # знакомство ведёт Claude
+        return
     if chat.configured:
         await update.effective_message.reply_text(HELP, reply_markup=KEYBOARD)
     elif chat.setup_step:
@@ -424,6 +427,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.application.bot_data.get("assistant"):
+        store(context).update_chat(update.effective_chat.id, setup_step="name")
+        await handle_text(update, context, "Хочу заново заполнить анкету")
+        return
     await begin_setup(update, context)
 
 
@@ -622,6 +629,10 @@ class ChatTools:
             if not birth or birth > self.now.date():
                 raise ValueError("дата рождения: ДД.ММ.ГГГГ")
             self.s.update_chat(chat_id, birth_date=birth)
+        elif setting == "age_months":
+            if not v.isdigit() or not 0 < int(v) < 120:
+                raise ValueError("возраст в месяцах: целое число")
+            self.s.update_chat(chat_id, birth_date=birth_date_from_age(int(v), self.now.date()))
         elif setting == "naps_per_day":
             if v == "auto":
                 self.s.update_chat(chat_id, naps_pref=None)
@@ -690,7 +701,38 @@ class ChatTools:
         self.plan_changed = accept
         return result
 
+    def finish_setup(self) -> str:
+        chat = self.chat
+        missing = [name for name, value in (("имя", chat.child_name), ("пол", chat.gender),
+                                            ("дата рождения", chat.birth_date)) if not value]
+        if missing:
+            raise ValueError("ещё не известно: " + ", ".join(missing))
+        if chat.wake_usual:
+            h, m = map(int, chat.wake_usual.split(":"))
+            morning = f"{min(h + 1, 23):02d}:{m:02d}"
+        else:
+            morning = "09:00"  # подъём «по-разному» — спрашиваем попозже
+        self.s.update_chat(chat.chat_id, setup_step=None, morning_check=morning)
+        self.chat = self.s.chat(chat.chat_id)
+        self.plan_changed = True
+        return "Анкета заполнена. Итог для родителя:\n" + setup_summary(self.chat)
+
+    def setup_state(self) -> str:
+        chat = self.chat
+        sex = {"m": "мальчик", "f": "девочка"}.get(chat.gender)
+        known = [
+            ("имя", chat.child_name), ("пол", sex),
+            ("дата рождения", f"{chat.birth_date:%d.%m.%Y}" if chat.birth_date else None),
+            ("дневных снов", chat.naps_pref if chat.naps_pref is not None else None),
+            ("обычный подъём", chat.wake_usual),
+            ("часовой пояс", f"{chat.tz} (по умолчанию, если город ещё не называли)"),
+        ]
+        return (f"Сейчас {self.now:%d.%m.%Y %H:%M}. Анкета ребёнка: "
+                + "; ".join(f"{k}: {v if v is not None else 'не указано'}" for k, v in known) + ".")
+
     def state(self) -> str:
+        if not self.chat.configured:
+            return self.setup_state()
         chat, tz, now = self.chat, self.tz, self.now
         months = age_in_months(chat.birth_date, now.date())
         sex = {"m": "мальчик", "f": "девочка"}.get(chat.gender, "пол не указан")
@@ -749,9 +791,12 @@ def is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(sender and me and sender.id == getattr(me, "id", None))
 
 
+BUTTONS = (BTN_WAKE, BTN_SLEEP, BTN_PLAN, BTN_TODAY)
+
+
 async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Chat,
                                 text: str, heard: str, files: list[dict] | None = None,
-                                label: str = "") -> bool:
+                                label: str = "", setup: bool = False) -> bool:
     """True, если сообщение обработал Claude; False — пусть разбирают правила."""
     assistant: Assistant | None = context.application.bot_data.get("assistant")
     if assistant is None:
@@ -763,7 +808,8 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
         user = getattr(update, "effective_user", None)
         reply_text = await assistant.handle(
             chat.chat_id, text, tools.state(), tools, files, label, group=is_group(update),
-            addressed=is_addressed(update, context), author=getattr(user, "first_name", "") or "")
+            addressed=text in BUTTONS or is_addressed(update, context),
+            author=getattr(user, "first_name", "") or "", setup=setup)
     except Exception:
         if not (tools.changed or tools.plan_changed):
             log.exception("Claude недоступен, разбираю сообщение правилами")
@@ -794,6 +840,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     heard = f"🎤 «{text}»\n\n" if voice else ""
     private = update.effective_chat.type == "private"
 
+    # Всё, включая анкету и кнопки, отвечает Claude; правила ниже — запасной путь без него.
+    if not chat.configured and context.application.bot_data.get("assistant"):
+        if not chat.setup_step:
+            s.update_chat(chat.chat_id, setup_step="name")
+            chat = s.chat(chat.chat_id)
+        if await handle_with_assistant(update, context, chat, text, heard, setup=True):
+            return
+    elif chat.configured and await handle_with_assistant(update, context, chat, text, heard):
+        return
+
     if text == BTN_PLAN:
         await plan_cmd(update, context)
         return
@@ -805,11 +861,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         return
     if not chat.configured:
         await begin_setup(update, context)
-        return
-
-    # Кнопки разбираем сами — мгновенно и бесплатно; всё остальное — через Claude, если он есть.
-    if text not in (BTN_WAKE, BTN_SLEEP) and await handle_with_assistant(
-            update, context, chat, text, heard):
         return
 
     tz = tz_of(chat)

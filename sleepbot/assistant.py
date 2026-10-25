@@ -156,6 +156,32 @@ TOOLS = [
 ]
 
 
+SETUP_TOOLS = [
+    _tool("update_settings", "Сохранить ответ анкеты.", {
+        "setting": {"type": "string", "enum": [
+            "child_name", "gender", "birth_date", "age_months", "naps_per_day", "usual_wake",
+            "timezone"]},
+        "value": {"type": "string", "description":
+                  "child_name — имя; gender — m или f; birth_date — ДД.ММ.ГГГГ; age_months — "
+                  "возраст в месяцах, если дату не назвали; naps_per_day — 0–3 или auto; "
+                  "usual_wake — ЧЧ:ММ или none (по-разному); timezone — IANA, например Europe/Moscow"},
+    }),
+    _tool("finish_setup", "Завершить анкету, когда известны имя, пол, дата рождения и часовой пояс. "
+          "Возвращает итог — перескажи его родителю своими словами.", {}),
+]
+
+SETUP_NOTE = """Анкета ещё не заполнена — сначала познакомься с ребёнком. Узнай по одному-два вопроса за раз:
+имя; мальчик или девочка; дату рождения (если называют только возраст — сохрани age_months);
+сколько раз сейчас спит днём (не знают — auto); во сколько обычно просыпается (по-разному — none);
+в каком городе живут — по нему сохрани timezone в формате IANA. Сохраняй каждый ответ сразу через
+update_settings; если сказали сразу несколько вещей — сохрани всё. Когда известны имя, пол, дата
+рождения и часовой пояс, вызови finish_setup и расскажи итог своими словами, коротко.
+Если родитель только начал разговор (/start, «привет») — коротко представься: ведёшь сон ребёнка,
+считаешь дневной сон и отбой по возрасту, напоминаешь заранее, понимаешь голосовые, — и задай
+первый вопрос.
+"""
+
+
 class Assistant:
     def __init__(self, api_key: str, proxy: str | None = None, model: str = MODEL,
                  effort: str = EFFORT) -> None:
@@ -175,14 +201,17 @@ class Assistant:
 
     async def handle(self, chat_id: int, text: str, state: str, tools,
                      attachments: list[dict] | None = None, label: str = "",
-                     group: bool = False, addressed: bool = False, author: str = "") -> str:
+                     group: bool = False, addressed: bool = False, author: str = "",
+                     setup: bool = False) -> str:
         """state — описание дня для модели; tools — объект с методами-инструментами
         (record_event, update_event, …) и state(), работающий с базой бота.
         attachments — блоки фото и файлов (attachments.to_block), label — их название для истории.
         group — общий чат родителей: там модель может промолчать, тогда вернётся пустая строка."""
         history = self.history.setdefault(chat_id, [])
         prompt = f"<Состояние>\n{state}\n</Состояние>\n\n"
-        if group:
+        if setup:
+            prompt += SETUP_NOTE
+        elif group:
             prompt += f"Это общий чат родителей, пишет {author or 'один из родителей'}. "
             prompt += ("Сообщение обращено к тебе — ответь.\n" if addressed else
                        "Родители переписываются и между собой. Если сообщение не обращено к тебе "
@@ -200,7 +229,7 @@ class Assistant:
                 model=self.model,
                 max_tokens=8000,
                 system=CACHED_SYSTEM,
-                tools=TOOLS,
+                tools=SETUP_TOOLS if setup else TOOLS,
                 messages=messages,
                 cache_control={"type": "ephemeral"},  # хвост: переиспользуется в цикле инструментов
                 output_config={"effort": self.effort},
@@ -230,7 +259,7 @@ class Assistant:
     def _run_tool(block, tools) -> dict:
         try:
             args = block.input if isinstance(block.input, dict) else json.loads(block.input)
-            if block.name not in {t["name"] for t in TOOLS}:
+            if block.name not in {t["name"] for t in TOOLS + SETUP_TOOLS}:
                 raise ValueError(f"неизвестный инструмент {block.name}")
             result = getattr(tools, block.name)(**args)
             return {"type": "tool_result", "tool_use_id": block.id,
