@@ -137,9 +137,12 @@ def plan_text(chat: Chat, plan: DayPlan, now: datetime) -> str:
 
     if plan.morning_wake is None:
         if plan.status == "night":
-            lines.append(f"🌙 Ночной сон с {hm(plan.status_since, tz)}, "
-                         f"идёт {format_duration(now - plan.status_since)}. "
-                         f"Норма в этом возрасте — {norm.night_hours} ч.")
+            start = plan.status_since
+            earliest = start + timedelta(hours=norm.night_min)
+            latest = start + timedelta(hours=norm.night_max)
+            lines.append(f"🌙 Ночной сон с {hm(start, tz)}, идёт {format_duration(now - start)}.")
+            lines.append(f"⏰ Подъём примерно в {hm(earliest, tz)}–{hm(latest, tz)} "
+                         f"(норма ночного сна в этом возрасте — {norm.night_hours} ч).")
         else:
             lines.append("Утренний подъём не отмечен.")
         if expected := expected_plan(chat, now):

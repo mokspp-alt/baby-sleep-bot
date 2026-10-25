@@ -241,3 +241,14 @@ def test_onboarding_accepts_month_names():
     a = onboarding.apply("age", "27 октября 2024", {}, date(2026, 10, 25),
                          datetime(2026, 10, 25, 17, 0, tzinfo=timezone.utc))
     assert a.updates["birth_date"] == date(2024, 10, 27) and a.error is None
+
+
+
+def test_night_plan_shows_expected_wake():
+    s = Storage(":memory:")
+    s.update_chat(1, child_name="Лёва", gender="m", birth_date=date(2024, 10, 27))
+    tz = ZoneInfo("Europe/Moscow")
+    s.add_event(1, NIGHT, datetime(2026, 10, 25, 20, 30, tzinfo=tz))
+    now = datetime(2026, 10, 25, 20, 37, tzinfo=tz)
+    text = bot.plan_text(s.chat(1), bot.day_plan(s.chat(1), s, now), now)
+    assert "⏰ Подъём примерно в 07:30–08:30 (норма ночного сна в этом возрасте — 11–12 ч)" in text
