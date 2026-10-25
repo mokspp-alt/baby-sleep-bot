@@ -798,12 +798,13 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
         reply_text = "Изменения внесены, но ответ не получился. Проверьте план ниже."
     if not reply_text and not (tools.changed or tools.plan_changed):
         return True  # в группе сообщение было не боту
-    reply = heard + reply_text
     events = [e for e in (s.event(chat.chat_id, i) for i in reversed(tools.changed)) if e]
     event = events[0] if events else None
+    reply = heard + reply_text
     if tools.changed or tools.plan_changed:
+        # План — выше, ответ Claude — последним: его вопрос («Как засыпал?») виден над полем ввода.
         chat = s.chat(chat.chat_id)
-        reply += "\n\n" + plan_text(chat, day_plan(chat, s, now), now)
+        reply = heard + plan_text(chat, day_plan(chat, s, now), now) + "\n\n" + reply_text
     await update.effective_message.reply_text(
         reply, reply_markup=event_keyboard(event, s, chat.chat_id) if event else KEYBOARD)
     return True

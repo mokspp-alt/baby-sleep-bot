@@ -164,7 +164,8 @@ def test_buttons_go_through_claude_with_rule_fallback():
         ("tool_use", [tool_use("t1", "record_event", kind="wake", time="now", day="today")]),
         ("end_turn", [text("Доброе утро! Записал подъём.")]),
     ])
-    assert say(s, a, bot.BTN_WAKE).startswith("Доброе утро!")
+    reply = say(s, a, bot.BTN_WAKE)
+    assert reply.startswith("📅 План на сегодня") and reply.endswith("Доброе утро! Записал подъём.")
     assert "☀️ Проснулись" in a.client.beta.messages.calls[0]["messages"][-1]["content"][-1]["text"]
 
     broken = fake_assistant([ConnectionError("нет сети")])
@@ -195,7 +196,7 @@ def test_setup_conversation_with_claude():
     reply = say(s, a, "Москва, встаёт по-разному")
     chat = s.chat(1)
     assert chat.configured and chat.morning_check == "09:00" and chat.wake_usual is None
-    assert reply.startswith("Готово!") and "📅 План на сегодня — Лёва" in reply
+    assert reply.startswith("📅 План на сегодня — Лёва") and "Готово!" in reply
     finish = calls[-1]["messages"][-1]["content"][-1]
     assert "Анкета заполнена" in finish["content"]
 
@@ -272,7 +273,7 @@ def test_group_sleep_news_and_direct_questions_are_answered():
         ("end_turn", [text("Записал подъём.")]),
         ("end_turn", [text("Отбой около 19:15.")]),
     ])
-    assert say_in_group(s, a, "Лёва проснулся")[0].startswith("Записал подъём.")
+    assert say_in_group(s, a, "Лёва проснулся")[0].endswith("Записал подъём.")
     assert say_in_group(s, a, "а когда отбой?", reply_to_bot=True) == ["Отбой около 19:15."]
     prompt = a.client.beta.messages.calls[-1]["messages"][-1]["content"][-1]["text"]
     assert "обращено к тебе — ответь" in prompt
@@ -292,3 +293,22 @@ def test_group_photo_without_caption_is_skipped():
                               application=SimpleNamespace(bot_data={}))
     asyncio.run(bot.on_file(update, context))
     assert downloads == []
+
+
+def test_follow_up_question_and_mood_answer():
+    s = configured_storage()
+    night_id = s.add_event(1, NIGHT, datetime.now(TZ) - timedelta(hours=10))
+    a = fake_assistant([
+        ("tool_use", [tool_use("t1", "record_event", kind="wake", time="now", day="today")]),
+        ("end_turn", [text("Доброе утро! В каком настроении проснулся? Ночью просыпался?")]),
+        ("tool_use", [tool_use("t2", "record_feedback", sleep_event_id=night_id, mood="good",
+                               fall_asleep_minutes=-1, night_wakings=1)]),
+        ("end_turn", [text("Отлично, записал.")]),
+    ])
+    assert say(s, a, "проснулся").endswith("В каком настроении проснулся? Ночью просыпался?")
+    say(s, a, "весёлый, ночью один раз просыпался")
+    assert s.feedback(1)[night_id] == {"mood": "good", "latency": None, "wakings": 1}
+    # Вопрос бота остался в памяти — по нему модель понимает, к чему относится ответ.
+    assert a.history[1][1]["content"].endswith("Ночью просыпался?")
+    system = a.client.beta.messages.calls[0]["system"][0]["text"]
+    assert "Как засыпал — быстро и спокойно?" in system and "Не переспрашивай" in system
