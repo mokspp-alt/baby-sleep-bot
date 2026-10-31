@@ -158,6 +158,13 @@ def test_api_failure_falls_back_to_rules():
     assert [e.kind for e in s.events(1, datetime(2000, 1, 1, tzinfo=TZ))] == [WAKE]
 
 
+def test_api_failure_explains_why_not_understood():
+    s = configured_storage()
+    a = fake_assistant([ConnectionError("нет сети")])
+    reply = say(s, a, "укладывать рано")
+    assert "Claude сейчас недоступен" in reply and "Не понял" in reply
+
+
 def test_buttons_go_through_claude_with_rule_fallback():
     s = configured_storage()
     a = fake_assistant([

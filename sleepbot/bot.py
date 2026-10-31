@@ -789,7 +789,9 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
             chat.chat_id, text, tools.state(), tools, files, label, group=is_group(update),
             addressed=text in BUTTONS or is_addressed(update, context),
             author=getattr(user, "first_name", "") or "", setup=setup)
+        context.application.bot_data["assistant_down"] = False
     except Exception:
+        context.application.bot_data["assistant_down"] = True
         if not (tools.changed or tools.plan_changed):
             log.exception("Claude недоступен, разбираю сообщение правилами")
             return False
@@ -859,8 +861,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         return
     if not parsed:
         if private or voice:
+            # Без Claude бот понимает только простые фразы — пусть родитель знает почему.
+            down = ("⚠️ Claude сейчас недоступен, поэтому понимаю только простые фразы.\n\n"
+                    if context.application.bot_data.get("assistant_down") else "")
             await update.effective_message.reply_text(
-                heard + "Не понял. Скажите, например, «проснулся», «уснула 5 минут назад» "
+                heard + down + "Не понял. Скажите, например, «проснулся», «уснула 5 минут назад» "
                 "или «когда спать?». /help"
             )
         return
