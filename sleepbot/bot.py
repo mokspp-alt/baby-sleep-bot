@@ -1124,8 +1124,10 @@ def main() -> None:
     app.bot_data["storage"] = Storage(os.environ.get("DB_PATH", "sleep.db"))
     app.bot_data["stt"] = Transcriber()
     app.bot_data["assistant"] = Assistant.from_env()
+    assistant = app.bot_data["assistant"]
     log.info("Свободный диалог через Claude: %s",
-             "включён" if app.bot_data["assistant"] else "выключен (нет ANTHROPIC_API_KEY)")
+             f"включён ({'OpenRouter' if assistant.openrouter else 'Anthropic'}, {assistant.model})"
+             if assistant else "выключен (нет OPENROUTER_API_KEY и ANTHROPIC_API_KEY)")
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup_cmd))

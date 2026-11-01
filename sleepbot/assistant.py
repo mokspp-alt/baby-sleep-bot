@@ -16,7 +16,9 @@ import anthropic
 
 log = logging.getLogger(__name__)
 
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+MODEL = "claude-sonnet-5-5"
+OPENROUTER_URL = "https://openrouter.ai/api"  # Anthropic-совместимый вход OpenRouter
+OPENROUTER_MODEL = "anthropic/claude-sonnet-5.5"
 EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
 HISTORY_TURNS = 10  # сколько последних обменов репликами помнить
 SILENT = "—"  # так модель отвечает в группе, когда сообщение не к ней
@@ -193,21 +195,28 @@ update_settings; если сказали сразу несколько веще�
 
 
 class Assistant:
+    openrouter = False  # True — запросы идут через OpenRouter, а не напрямую в Anthropic
+
     def __init__(self, api_key: str, proxy: str | None = None, model: str = MODEL,
-                 effort: str = EFFORT) -> None:
-        self.model, self.effort = model, effort
+                 effort: str = EFFORT, openrouter: bool = False) -> None:
+        self.model, self.effort, self.openrouter = model, effort, openrouter
         http_client = anthropic.DefaultAsyncHttpxClient(proxy=proxy) if proxy else None
-        self.client = anthropic.AsyncAnthropic(api_key=api_key, http_client=http_client,
-                                               timeout=90.0)
+        # OpenRouter принимает ключ как Bearer-токен; ключ Anthropic туда не уходит.
+        auth = ({"auth_token": api_key, "base_url": OPENROUTER_URL} if openrouter
+                else {"api_key": api_key})
+        self.client = anthropic.AsyncAnthropic(**auth, http_client=http_client, timeout=90.0)
         self.history: dict[int, list[dict]] = {}
 
     @classmethod
     def from_env(cls) -> Assistant | None:
-        key = os.environ.get("ANTHROPIC_API_KEY")
-        if not key:
-            return None
+        """OPENROUTER_API_KEY важнее ANTHROPIC_API_KEY: задан — запросы идут через OpenRouter."""
         proxy = os.environ.get("ANTHROPIC_PROXY") or os.environ.get("TELEGRAM_PROXY") or None
-        return cls(key, proxy)
+        if key := os.environ.get("OPENROUTER_API_KEY"):
+            return cls(key, proxy, os.environ.get("CLAUDE_MODEL") or OPENROUTER_MODEL,
+                       openrouter=True)
+        if key := os.environ.get("ANTHROPIC_API_KEY"):
+            return cls(key, proxy, os.environ.get("CLAUDE_MODEL") or MODEL)
+        return None
 
     async def handle(self, chat_id: int, text: str, state: str, tools,
                      attachments: list[dict] | None = None, label: str = "",
@@ -231,10 +240,16 @@ class Assistant:
         prompt += f"Сообщение родителя: {text}"
         content = [*(attachments or []), {"type": "text", "text": prompt}]
         messages = _with_history_breakpoint(history) + [{"role": "user", "content": content}]
-        extra = {}
-        if not self.model.startswith("claude-haiku"):
-            # Если модель откажется отвечать, API сам повторит запрос на другой. У Haiku такого нет.
-            extra = {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
+        if self.openrouter:
+            # Только стандартные поля Messages API: прочее OpenRouter может отвергнуть.
+            # Кэш остаётся на блоках (system, история).
+            extra = {}
+        else:
+            extra = {"cache_control": {"type": "ephemeral"},  # хвост: переиспользуется в цикле инструментов
+                     "output_config": {"effort": self.effort}}
+            if "haiku" not in self.model:
+                # Если модель откажется отвечать, API сам повторит запрос на другой. У Haiku такого нет.
+                extra |= {"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
         for _ in range(10):
             response = await self.client.beta.messages.create(
                 model=self.model,
@@ -242,8 +257,6 @@ class Assistant:
                 system=CACHED_SYSTEM,
                 tools=SETUP_TOOLS if setup else TOOLS,
                 messages=messages,
-                cache_control={"type": "ephemeral"},  # хвост: переиспользуется в цикле инструментов
-                output_config={"effort": self.effort},
                 **extra,
             )
             if response.stop_reason == "refusal":
