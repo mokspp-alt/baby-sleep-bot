@@ -350,3 +350,19 @@ def test_openrouter_adds_provider_prefix(monkeypatch):
     for name in ("claude-haiku-5-5", "claude-haiku-5.5", "anthropic/claude-haiku-5-5"):
         monkeypatch.setenv("CLAUDE_MODEL", name)
         assert Assistant.from_env().model == "anthropic/claude-haiku-5.5"
+
+
+def test_owner_alerted_once_on_outage_and_recovery(monkeypatch):
+    monkeypatch.setenv("ADMIN_CHAT_ID", "42")
+    alerts = []
+
+    async def send_message(chat_id, text, **kw):
+        alerts.append((chat_id, text))
+
+    context = SimpleNamespace(bot=SimpleNamespace(send_message=send_message),
+                              application=SimpleNamespace(bot_data={}))
+    down = RuntimeError("403 verification_required")
+    for error in (down, down, None, None):
+        asyncio.run(bot.set_assistant_down(context, error))
+    assert [c for c, _ in alerts] == [42, 42]
+    assert "verification_required" in alerts[0][1] and "снова отвечает" in alerts[1][1]

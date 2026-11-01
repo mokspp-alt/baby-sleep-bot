@@ -417,6 +417,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(HELP, reply_markup=KEYBOARD)
 
 
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Номер чата — для ADMIN_CHAT_ID в .env."""
+    await update.effective_message.reply_text(f"ID этого чата: {update.effective_chat.id}")
+
+
 async def child_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(context.args)
     birth = parse_birth_date(text)
@@ -773,6 +778,23 @@ def is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 BUTTONS = (BTN_WAKE, BTN_SLEEP, BTN_PLAN, BTN_TODAY)
 
 
+async def set_assistant_down(context: ContextTypes.DEFAULT_TYPE, error: Exception | None) -> None:
+    """Запоминает, отвечает ли Claude. При сбое и при восстановлении — по одному сообщению
+    владельцу бота (ADMIN_CHAT_ID), чтобы он узнал о проблеме раньше пользователей."""
+    data = context.application.bot_data
+    was_down, down = data.get("assistant_down", False), error is not None
+    data["assistant_down"] = down
+    admin, bot_ = os.environ.get("ADMIN_CHAT_ID"), getattr(context, "bot", None)
+    if was_down == down or not admin or bot_ is None:
+        return
+    text = (f"⚠️ Claude перестал отвечать, бот перешёл в запасной режим.\n\n"
+            f"{type(error).__name__}: {str(error)[:600]}" if down else "✅ Claude снова отвечает.")
+    try:
+        await bot_.send_message(int(admin), text)
+    except Exception:
+        log.exception("Не удалось предупредить владельца бота")
+
+
 async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TYPE, chat: Chat,
                                 text: str, heard: str, files: list[dict] | None = None,
                                 label: str = "", setup: bool = False) -> bool:
@@ -789,9 +811,9 @@ async def handle_with_assistant(update: Update, context: ContextTypes.DEFAULT_TY
             chat.chat_id, text, tools.state(), tools, files, label, group=is_group(update),
             addressed=text in BUTTONS or is_addressed(update, context),
             author=getattr(user, "first_name", "") or "", setup=setup)
-        context.application.bot_data["assistant_down"] = False
-    except Exception:
-        context.application.bot_data["assistant_down"] = True
+        await set_assistant_down(context, None)
+    except Exception as e:
+        await set_assistant_down(context, e)
         if not (tools.changed or tools.plan_changed):
             log.exception("Claude недоступен, разбираю сообщение правилами")
             return False
@@ -1136,6 +1158,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("child", child_cmd))
     app.add_handler(CommandHandler("tz", tz_cmd))
     app.add_handler(CommandHandler("remind", remind_cmd))
