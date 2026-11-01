@@ -162,7 +162,7 @@ def test_api_failure_explains_why_not_understood():
     s = configured_storage()
     a = fake_assistant([ConnectionError("нет сети")])
     reply = say(s, a, "укладывать рано")
-    assert "Claude сейчас недоступен" in reply and "Не понял" in reply
+    assert "технический сбой" in reply and "проснулся в 14:24" in reply
 
 
 def test_buttons_go_through_claude_with_rule_fallback():
