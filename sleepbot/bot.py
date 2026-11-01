@@ -17,7 +17,7 @@ from telegram import (
     InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
@@ -932,6 +932,27 @@ async def typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 LONG_VOICE = 20  # секунд: о таких голосовых предупреждаем, что понадобится время
 
 
+DOWNLOAD_TRIES = 3
+DOWNLOAD_TIMEOUT = 120  # секунд: через прокси Telegram файлы идут медленно
+
+
+async def download(media) -> bytes:
+    """Скачивает файл из Telegram. Через прокси соединение иногда обрывается или
+    отвечает слишком долго — тогда пробуем ещё раз."""
+    for attempt in range(1, DOWNLOAD_TRIES + 1):
+        try:
+            file = await media.get_file(read_timeout=60, connect_timeout=30)
+            return bytes(await file.download_as_bytearray(
+                read_timeout=DOWNLOAD_TIMEOUT, connect_timeout=30))
+        except NetworkError:  # в том числе TimedOut
+            if attempt == DOWNLOAD_TRIES:
+                raise
+            log.warning("Файл не скачался (попытка %s из %s), пробую ещё раз",
+                        attempt, DOWNLOAD_TRIES)
+            await asyncio.sleep(2 * attempt)
+    raise AssertionError("unreachable")
+
+
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Голосовые, аудиофайлы и «кружочки»: распознаём речь и обрабатываем как текст."""
     message = update.effective_message
@@ -944,8 +965,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "voice")
             try:
-                file = await media.get_file()
-                await file.download_to_drive(path)
+                data = await download(media)
+                with open(path, "wb") as f:
+                    f.write(data)
                 text = await context.application.bot_data["stt"].transcribe(path)
             except Exception:
                 log.exception("Не удалось распознать голосовое (%s с)", duration)
@@ -982,7 +1004,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     try:
-        data = bytes(await (await media.get_file()).download_as_bytearray())
+        data = await download(media)
         block = attachments.to_block(name, mime, data)
     except attachments.UnsupportedFile as e:
         await message.reply_text(str(e))
