@@ -861,13 +861,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         return
     if not parsed:
         if private or voice:
-            # Без Claude бот понимает только простые фразы — пусть родитель знает почему.
-            down = ("⚠️ Claude сейчас недоступен, поэтому понимаю только простые фразы.\n\n"
-                    if context.application.bot_data.get("assistant_down") else "")
-            await update.effective_message.reply_text(
-                heard + down + "Не понял. Скажите, например, «проснулся», «уснула 5 минут назад» "
-                "или «когда спать?». /help"
-            )
+            if context.application.bot_data.get("assistant_down"):
+                # Сбой не по вине родителя: извиняемся и говорим, что пока работает.
+                reply = ("🙏 Простите, у меня сейчас технический сбой, и обычную речь я "
+                         "временно не понимаю. Скоро всё починим.\n\n"
+                         f"Пока отмечайте сон кнопками «{BTN_WAKE}» и «{BTN_SLEEP}» "
+                         "или короткими фразами: «проснулся в 14:24», «уснул 10 минут назад», "
+                         "«когда спать?». Напоминания работают как обычно.")
+            else:
+                reply = ("Не совсем понял 🙂 Напишите, например, «проснулся в 14:24», "
+                         "«уснула 5 минут назад» или «когда спать?». /help")
+            await update.effective_message.reply_text(heard + reply, reply_markup=KEYBOARD)
         return
 
     if parsed.action == WAKE:
