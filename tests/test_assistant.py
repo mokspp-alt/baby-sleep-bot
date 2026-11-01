@@ -289,7 +289,7 @@ def test_group_sleep_news_and_direct_questions_are_answered():
 def test_group_photo_without_caption_is_skipped():
     downloads = []
 
-    async def get_file():
+    async def get_file(**kw):
         downloads.append(1)
 
     message = SimpleNamespace(photo=[SimpleNamespace(file_size=1, get_file=get_file)], document=None,

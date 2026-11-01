@@ -101,8 +101,8 @@ def test_photo_to_records():
     async def reply_text(t, reply_markup=None):
         sent.append(t)
 
-    async def get_file():
-        async def download_as_bytearray():
+    async def get_file(**kw):
+        async def download_as_bytearray(**kw):
             return bytearray(png(1000, 800))
         return SimpleNamespace(download_as_bytearray=download_as_bytearray)
 

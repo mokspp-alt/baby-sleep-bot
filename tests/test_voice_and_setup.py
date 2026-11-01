@@ -197,10 +197,10 @@ def run_voice(media_kind, duration, transcript):
     async def send_chat_action(chat_id, action):
         actions.append(action)
 
-    async def get_file():
-        async def download_to_drive(path):
-            open(path, "wb").close()
-        return SimpleNamespace(download_to_drive=download_to_drive)
+    async def get_file(**kw):
+        async def download_as_bytearray(**kw):
+            return bytearray()
+        return SimpleNamespace(download_as_bytearray=download_as_bytearray)
 
     class STT:
         async def transcribe(self, path):
@@ -252,3 +252,23 @@ def test_night_plan_shows_expected_wake():
     now = datetime(2026, 10, 25, 20, 37, tzinfo=tz)
     text = bot.plan_text(s.chat(1), bot.day_plan(s.chat(1), s, now), now)
     assert "⏰ Подъём примерно в 07:30–08:30 (норма ночного сна в этом возрасте — 11–12 ч)" in text
+
+
+def test_download_retries_after_timeout(monkeypatch):
+    from telegram.error import TimedOut
+    async def no_wait(seconds):
+        pass
+
+    monkeypatch.setattr(bot.asyncio, "sleep", no_wait)
+    tries = []
+
+    async def get_file(**kw):
+        async def download_as_bytearray(**kw):
+            tries.append(kw["read_timeout"])
+            if len(tries) < 3:
+                raise TimedOut()
+            return bytearray(b"ok")
+        return SimpleNamespace(download_as_bytearray=download_as_bytearray)
+
+    assert asyncio.run(bot.download(SimpleNamespace(get_file=get_file))) == b"ok"
+    assert tries == [bot.DOWNLOAD_TIMEOUT] * 3
