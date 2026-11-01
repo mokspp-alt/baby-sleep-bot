@@ -1002,21 +1002,22 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if (media.file_size or 0) > MAX_FILE_BYTES:
         await message.reply_text("Файл больше 20 МБ — Telegram не отдаёт боту такие. Пришлите поменьше.")
         return
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    try:
-        data = await download(media)
-        block = attachments.to_block(name, mime, data)
-    except attachments.UnsupportedFile as e:
-        await message.reply_text(str(e))
-        return
-    except Exception:
-        log.exception("Не удалось скачать файл")
-        await message.reply_text("Не получилось скачать файл. Попробуйте ещё раз.")
-        return
-    text = message.caption or "Посмотри, что здесь, и помоги разобраться."
-    if not await handle_with_assistant(update, context, chat, text, "", [block], name):
-        await message.reply_text("Не получилось разобрать файл: Claude сейчас недоступен. "
-                                 "Попробуйте чуть позже.")
+    # «Печатает…» — в фоне: если прокси на нём зависнет, фото всё равно разберём.
+    async with typing(context, update.effective_chat.id):
+        try:
+            data = await download(media)
+            block = attachments.to_block(name, mime, data)
+        except attachments.UnsupportedFile as e:
+            await message.reply_text(str(e))
+            return
+        except Exception:
+            log.exception("Не удалось скачать файл")
+            await message.reply_text("Не получилось скачать файл. Попробуйте ещё раз.")
+            return
+        text = message.caption or "Посмотри, что здесь, и помоги разобраться."
+        if not await handle_with_assistant(update, context, chat, text, "", [block], name):
+            await message.reply_text("Не получилось разобрать файл: Claude сейчас недоступен. "
+                                     "Попробуйте чуть позже.")
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -107,7 +107,8 @@ def test_photo_to_records():
         return SimpleNamespace(download_as_bytearray=download_as_bytearray)
 
     async def send_chat_action(*args):
-        pass
+        from telegram.error import TimedOut
+        raise TimedOut()  # прокси завис на «печатает…» — фото всё равно разбираем
 
     photo = SimpleNamespace(file_size=50_000, get_file=get_file)
     message = SimpleNamespace(photo=[photo], document=None, caption="запиши сон из дневника",
