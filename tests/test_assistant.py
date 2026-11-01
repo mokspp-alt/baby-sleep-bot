@@ -326,7 +326,7 @@ def test_openrouter_from_env_uses_bearer_and_plain_request(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-old")
     monkeypatch.delenv("CLAUDE_MODEL", raising=False)
     a = Assistant.from_env()
-    assert a.openrouter and a.model == "anthropic/claude-sonnet-5.5"
+    assert a.openrouter and a.model == "anthropic/claude-sonnet-5-5"
     assert str(a.client.base_url).startswith("https://openrouter.ai/api")
     assert a.client.auth_headers == {"Authorization": "Bearer sk-or-test"}
 
@@ -343,3 +343,9 @@ def test_anthropic_key_without_openrouter(monkeypatch):
     monkeypatch.delenv("CLAUDE_MODEL", raising=False)
     a = Assistant.from_env()
     assert not a.openrouter and a.model == "claude-sonnet-5-5"
+
+
+def test_openrouter_adds_provider_prefix(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("CLAUDE_MODEL", "claude-haiku-5-5")
+    assert Assistant.from_env().model == "anthropic/claude-haiku-5-5"
