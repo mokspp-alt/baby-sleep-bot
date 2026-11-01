@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 MODEL = "claude-sonnet-5-5"
 OPENROUTER_URL = "https://openrouter.ai/api"  # Anthropic-совместимый вход OpenRouter
-OPENROUTER_MODEL = "anthropic/claude-sonnet-5.5"
+OPENROUTER_MODEL = "anthropic/claude-sonnet-5-5"
 EFFORT = os.environ.get("CLAUDE_EFFORT", "low")
 HISTORY_TURNS = 10  # сколько последних обменов репликами помнить
 SILENT = "—"  # так модель отвечает в группе, когда сообщение не к ней
@@ -212,8 +212,10 @@ class Assistant:
         """OPENROUTER_API_KEY важнее ANTHROPIC_API_KEY: задан — запросы идут через OpenRouter."""
         proxy = os.environ.get("ANTHROPIC_PROXY") or os.environ.get("TELEGRAM_PROXY") or None
         if key := os.environ.get("OPENROUTER_API_KEY"):
-            return cls(key, proxy, os.environ.get("CLAUDE_MODEL") or OPENROUTER_MODEL,
-                       openrouter=True)
+            model = os.environ.get("CLAUDE_MODEL") or OPENROUTER_MODEL
+            if "/" not in model:
+                model = f"anthropic/{model}"  # claude-haiku-5-5 → anthropic/claude-haiku-5-5
+            return cls(key, proxy, model, openrouter=True)
         if key := os.environ.get("ANTHROPIC_API_KEY"):
             return cls(key, proxy, os.environ.get("CLAUDE_MODEL") or MODEL)
         return None
