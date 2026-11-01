@@ -129,6 +129,9 @@ def _hours(h: float) -> timedelta:
 Overrides = dict[tuple[int, str], datetime]
 
 
+MIN_NIGHT = timedelta(hours=3)  # подъём раньше этого после отбоя — ночное пробуждение
+
+
 def build_plan(events: list[Event], now: datetime, norm: AgeNorm,
                overrides: Overrides | None = None) -> DayPlan:
     """Строит план текущего дня по событиям (в хронологическом порядке).
@@ -152,6 +155,12 @@ def build_plan(events: list[Event], now: datetime, norm: AgeNorm,
     if night_idx < 0:
         candidates = [e for e in candidates if now - e.ts < timedelta(hours=20)]
     first_wake = next((i for i, e in enumerate(candidates) if e.kind == WAKE), None)
+    if night_idx >= 0:
+        # «Проснулся» вскоре после отбоя — ночное пробуждение, а не утро: берём подъём,
+        # до которого ночь длилась хотя бы 3 часа, если такой есть.
+        night_start = events[night_idx].ts
+        first_wake = next((i for i, e in enumerate(candidates)
+                           if e.kind == WAKE and e.ts - night_start >= MIN_NIGHT), first_wake)
     if first_wake is None:
         return plan
     day = candidates[first_wake:]
@@ -166,7 +175,7 @@ def build_plan(events: list[Event], now: datetime, norm: AgeNorm,
 
     if night_idx >= 0 and events[night_idx].ts < plan.morning_wake.ts:
         night = plan.morning_wake.ts - events[night_idx].ts
-        if timedelta(hours=3) <= night <= timedelta(hours=16):
+        if MIN_NIGHT <= night <= timedelta(hours=16):
             plan.night = night
             plan.nap_shift, plan.bed_shift = night_shifts(night, norm)
 

@@ -165,3 +165,12 @@ def test_long_night_moves_day_later():
     # Очень длинная ночь сдвигает не больше чем на полчаса.
     plan = build_plan([ev(1, NIGHT, at(18, 0, 23)), ev(2, WAKE, at(9, 0))], at(10), norm)
     assert plan.bed_shift == -timedelta(minutes=30)
+
+
+def test_waking_soon_after_bedtime_is_not_morning():
+    # Уснул в 21:56, «проснулся» в 22:08 (ночное пробуждение), утром встал в 7:50.
+    events = [ev(1, NIGHT, at(21, 56, 23)), ev(2, WAKE, at(22, 8, 23)), ev(3, WAKE, at(7, 50)),
+              ev(4, NAP, at(13, 6))]
+    plan = build_plan(events, at(14), NORM_2Y)
+    assert plan.morning_wake.id == 3
+    assert plan.night == timedelta(hours=9, minutes=54)
