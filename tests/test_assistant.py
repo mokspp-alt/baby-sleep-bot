@@ -319,3 +319,27 @@ def test_follow_up_question_and_mood_answer():
     assert a.history[1][1]["content"].endswith("Ночью просыпался?")
     system = a.client.beta.messages.calls[0]["system"][0]["text"]
     assert "Как засыпал — быстро и спокойно?" in system and "Не переспрашивай" in system
+
+
+def test_openrouter_from_env_uses_bearer_and_plain_request(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-old")
+    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+    a = Assistant.from_env()
+    assert a.openrouter and a.model == "anthropic/claude-sonnet-5.5"
+    assert str(a.client.base_url).startswith("https://openrouter.ai/api")
+    assert a.client.auth_headers == {"Authorization": "Bearer sk-or-test"}
+
+    fake = fake_assistant([("end_turn", [text("Привет!")])])
+    fake.openrouter = True
+    say(configured_storage(), fake, "как дела?")
+    sent = fake.client.beta.messages.calls[0]
+    assert not {"betas", "fallbacks", "output_config", "cache_control"} & sent.keys()
+
+
+def test_anthropic_key_without_openrouter(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
+    a = Assistant.from_env()
+    assert not a.openrouter and a.model == "claude-sonnet-5-5"
