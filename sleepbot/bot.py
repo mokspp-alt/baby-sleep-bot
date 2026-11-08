@@ -22,6 +22,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
+from . import net
 from . import onboarding
 from . import attachments
 from .assistant import Assistant, parse_hhmm, resolve_time
@@ -1127,10 +1128,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Не удалось сообщить об ошибке")
 
 
+def test_chat_ids(raw: str | None = None) -> set[int]:
+    """Чаты из TEST_CHAT_IDS: в них можно проверять бота, но напоминаний они не получают."""
+    raw = os.environ.get("TEST_CHAT_IDS", "") if raw is None else raw
+    ids: set[int] = set()
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            log.warning("TEST_CHAT_IDS: «%s» — не номер чата, пропускаю", part)
+    return ids
+
+
 async def tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     s = store(context)
+    ignored = test_chat_ids()
     for chat in s.chats():
-        if not chat.configured:
+        if not chat.configured or chat.chat_id in ignored:
             continue
         try:
             tz = tz_of(chat)
@@ -1170,6 +1186,10 @@ def main() -> None:
     if proxy := os.environ.get("TELEGRAM_PROXY"):
         builder = builder.proxy(proxy).get_updates_proxy(proxy)
     app = builder.build()
+    # Прокси иногда отвечает не сразу: повторяем сетевые ошибки, чтобы ответы и напоминания не терялись.
+    net.with_retries(app.bot)
+    if ignored := test_chat_ids():
+        log.info("Тестовые чаты без напоминаний: %s", ", ".join(map(str, sorted(ignored))))
     app.bot_data["storage"] = Storage(os.environ.get("DB_PATH", "sleep.db"))
     app.bot_data["stt"] = Transcriber()
     app.bot_data["assistant"] = Assistant.from_env()
