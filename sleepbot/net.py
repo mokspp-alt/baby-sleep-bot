@@ -8,7 +8,8 @@
 правки, файлы, getUpdates), поэтому повторяются и ответы, и напоминания.
 
 Повторяем только сетевые ошибки (:class:`telegram.error.NetworkError`,
-включая его наследника ``TimedOut``). Ошибки валидации и лимиты пробрасываем
+включая его наследника ``TimedOut``). Ошибки валидации (``BadRequest`` —
+в python-telegram-bot он тоже наследник ``NetworkError``) и лимиты пробрасываем
 сразу: повтор их не исправит.
 """
 
@@ -18,7 +19,7 @@ import asyncio
 import logging
 from typing import Any
 
-from telegram.error import NetworkError
+from telegram.error import BadRequest, NetworkError
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ def with_retries(bot: Any, attempts: int = ATTEMPTS,
         for attempt in range(attempts):
             try:
                 return await original(endpoint, data, **kwargs)
+            except BadRequest:
+                raise  # «чат не найден», «сообщение не изменилось» — повтор бесполезен
             except NetworkError as exc:
                 if attempt == attempts - 1:
                     raise
